@@ -1,0 +1,1595 @@
+#!/bin/bash
+shopt -s extglob
+source /usr/local/sbin/global-vars
+
+MISSING_OPTION_VALUE_ERROR='Missing value to option'
+
+export NEWLINE=$'\n' TAB=$'\t'
+export RE_S='[[:space:]]*' RE_D='[0-9]*'
+export RE_W='[a-zA-Z0-9_:{}%\-]*' RE_W_EX='[a-zA-Z0-9 /_\,\.:{}\"-\\]*'
+export RE_FS=$(echo @|tr @ '\034') RE_GS=$(echo @|tr @ '\035') RE_US=$(echo @|tr @ '\037')
+export RE_IP='[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}'
+export RE_CDIR="$RE_IP\\/[0-9]{1,2}"
+
+# (function)
+print() {
+    printf "\n%s\n" "$*";
+} # => print()
+
+# (function)
+print_status() {
+    local s=$?
+
+    case $s in
+        0) printf 'SUCCESS';;
+        1) printf 'FAILURE';;
+	*) printf $s;;
+    esac
+
+    return $s
+} # => return_status()
+
+# (function)
+current_time() {
+    date +"%D %H:%M:%S %Z"
+} # => current_time()
+
+prog_exit() {
+    ESTAT=0
+    [ -n "$1" ] && ESTAT=$1
+    (stty echo 2>/dev/null)
+    echo ""
+    exit "$ESTAT"
+} # => prog_exit()
+
+# (function)
+get_current_file_name() {
+    echo "$(basename "$(test -L "$0" && readlink "$0" || echo "$0")")"
+} # => get_current_file_name()
+
+# (function args)
+# $1 - length
+gen_rand_string() {
+    tr -dc A-Za-z0-9 </dev/urandom | head -c $1 ; echo ''
+} # => gen_rand_string()
+
+# (function args)
+# $1 - str
+escape_slashes() {
+    sed -r -e 's/\//\\\//g' <<<$1
+} # => escape_slashes()
+
+# (function args)
+# $1 - dirLocation
+# $2 - permissions
+create_dir() {
+    [ -d "$1" ] && return 1
+    mkdir -m $2 $1
+    return 0
+} # => create_dir()
+
+# (function args)
+# $1 - fileLocation
+# $2 - permissions
+install_null_file() {
+    [ -f "$1" ] && return 1
+    install -m $2 /dev/null $1
+    return 0
+} # => install_null_file()
+
+# (function args)
+# $1 - fileLocation
+# $2 - line
+file_contains_line() {
+    if [ -f "$1" ]; then
+        grep -q "^$2$" <<<"$(cat $1)"
+
+        return $?
+    else
+        return 2
+    fi
+} # => file_contains_line()
+
+[ -v SCRIPT_NAME ] || SCRIPT_NAME='netsys-base'
+[ -v TMP_DIR ] || export TMP_DIR=$(mktemp -d /tmp/${SCRIPT_NAME}.XXXXXXXXXX)
+
+CURRENT_EXEC_ID=$(get_current_file_name)-$$
+{ ! file_contains_line $TMP_DIR/sys-ids $CURRENT_EXEC_ID; } && echo "$CURRENT_EXEC_ID" >>$TMP_DIR/sys-ids
+
+# (function args)
+# $1 - fileName / randNameLength
+# $2 - permissions
+create_tmp_file() {
+    local s=0
+    [ -n "$1" ] \
+        && { grep -Eq "^$RE_D$" <<<$1 \
+            && local fileLocation="$TMP_DIR/$(gen_rand_string $1)" \
+            || local fileLocation="$TMP_DIR/$1"; } \
+        || local fileLocation="$TMP_DIR/$(gen_rand_string 8)"
+        
+    { [ -n "$2" ] && grep -Eq "^[0-9]{3}$" <<<$2; } \
+        && { install_null_file $fileLocation $2 || s=2; } \
+        || { install_null_file $fileLocation 640 || s=2; }
+
+    echo $fileLocation
+    return $s
+} # => create_tmp_file()
+
+# (function)
+cleanup_tmp_dir() {
+    [ ! -f "$TMP_DIR/sys-ids" ] && return 2
+
+    local s=0
+    while read -r sysID; do
+        [ "$CURRENT_EXEC_ID" != "$sysID" ] && s=1
+    done <$TMP_DIR/sys-ids
+    (($s == 0)) \
+        && rm -rf $TMP_DIR \
+        || sed -i -e "/$CURRENT_EXEC_ID/d" $TMP_DIR/sys-ids
+    return $s
+} # => cleanup_tmp_dir()
+
+# (function args)
+# $1 - fallbackVal
+# $2 - preferredVal
+get_either() {
+    if [ -n "$2" ]; then
+        echo "$2"
+        return 0
+    elif [ -n "$1" ]; then
+        echo "$1"
+        return 0
+    fi
+
+    return 1
+} # => get_either()
+
+# (function args)
+# $1 - str
+get_arg_opt() {
+    ! { ! grep -q '=' <<<${1%%:*} && echo "${1%%:*}" && return 0; } \
+        || ! grep -q ':' <<<${1%%=*} && echo "${1%%=*}"
+} # => get_arg_opt()
+
+# (function args)
+# $1 - str
+get_arg_val() {
+    ! { ! grep -q '=' <<<${1#*:} && echo "${1#*:}" && return 0; } \
+        || ! grep -q ':' <<<${1#*=} && echo "${1#*=}"
+} # => get_arg_val()
+
+# (function)
+print_args() {
+    local argsStr='' \
+        delimiter=$(sed -r -ne "/DEL:.{1}${RE_S}/b found; Q1; :found s/.*DEL:(.{1})${RE_S}.*/\1/p" <<<"$@") \
+        s=$?
+
+    printf -v argsStr "%s${delimiter:-$NEWLINE}" $(
+        (($s == 0)) && sed -r -e "s/(.*)*DEL:.{1}${RE_S}(.*)*/\1\2/" <<<"$@" || echo "$@"
+    )
+
+    echo "${argsStr:0:-1}"
+} # => print_args()
+
+# (function args)
+# $1 - msgType
+get_msg_type_index() {
+    case "$1" in
+        info) echo 0;;
+        debug) echo 1;;
+        warn) echo 2;;
+        die) echo 3;;
+        error) echo 4;;
+        *) echo -1;;
+    esac
+} # => get_msg_type_index()
+
+# (function args)
+# $1 - msgTypes
+# $2 - directiveStatement
+set_msg_directives() {
+    local oldIFS=$IFS mIndex=-1
+    IFS=','; for t in $1
+    do
+        mIndex=$(get_msg_type_index $t)
+
+        MSG_DIRECTIVES[$mIndex]="$t|$2"
+    done
+    IFS=$oldIFS
+} # => set_msg_directives()
+
+# (function args)
+# $1 - msgTypeDirective
+set_msg_output() {
+    local stdout=0 debug=0 f=''
+    local msgType=${1%|*} outTo=${1#*|}
+    local mIndex=$(get_msg_type_index $msgType)
+
+    case "$msgType" in
+        debug)
+            [ "$outTo" == 'debug' ] && debug=1 \
+                || { grep -q 'debug#file:' <<<"$outTo" && local logFile="${outTo##*:}"; }
+        ;;&
+        info|warn|die)
+            [ "$outTo" == 'stdout' ] && stdout=1 \
+                || { grep -q '#file:' <<<"$outTo" && local logFile="${outTo##*:}"; }
+        ;;&
+        info)
+            (($stdout == 1)) && exec 10>&1 \
+                || { [ -n "$logFile" ] && exec 10>>$logFile; } \
+                || exec 10>/dev/null
+        ;;
+        debug)
+            (($debug == 1)) && exec 11>&1 \
+                || { [ -n "$logFile" ] && exec 11>>$logFile; } \
+                || exec 11>/dev/null
+        ;;
+        warn)
+            (($stdout == 1)) && exec 12>&1 \
+                || { [ -n "$logFile" ] && exec 12>>$logFile; } \
+                || exec 12>/dev/null
+        ;;
+        die)
+            (($stdout == 1)) && exec 13>&1 \
+                || { [ -n "$logFile" ] && exec 13>>$logFile; } \
+                || exec 13>/dev/null
+        ;;
+        error)
+            (($stdout == 1)) && exec 14>&1 \
+                || { [ -n "$logFile" ] && exec 14>>$logFile; } \
+                || exec 14>/dev/null
+        ;;
+    esac
+} # => set_msg_output()
+
+# (function args)
+# $1 - cmd
+# $2 - opts
+msg() {
+    { [ -n "$1" ] && local cmd="$1"; } && shift
+
+    local opt='' val='' emptyOk=0
+    local msgType='' stdout=1 debug=0 debugFile='' logFile='' logFilePermissions='644' readDirectives=0
+    for arg in "$@"
+    do
+        emptyOk=0
+        opt="$(get_arg_opt $arg)"
+        val="$(get_arg_val $arg)"
+
+        case "$opt" in
+            file)
+                logFile="$val"
+            ;;
+            debug)
+                { [ "$val" = "$arg" ] || [ -z "$val" ]; } \
+                    && debug=1 || debugFile="$val"
+                emptyOk=1
+            ;;
+            permissions)
+                logFilePermissions="$val"
+            ;;
+            type)
+                msgType="$val"
+            ;;
+            read-directives)
+                readDirectives=1
+                emptyOk=1
+            ;;
+            quiet)
+                stdout=0
+                emptyOk=1
+            ;;
+        esac
+
+        if (($emptyOk == 0)) && { [ "$val" = "$arg" ] || [ -z "$val" ]; }; then
+            print "${FUNCNAME[0]}(): Missing value to option: $opt" 1>&2
+            prog_exit "${2:-1}"
+        fi
+    done
+
+    [ -z "$msgType" ] \
+        && { { (($MSG_INCLUDE_ERRORS == 1)) && msgType='info,warn,die,error' || msgType='info,die'; } \
+            && { (($MSG_INCLUDE_DEBUG == 1)) && msgType="${msgType},debug"; }; }
+
+    case "$cmd" in
+        get-current-output)
+            echo "${MSG_DIRECTIVES[*]}"
+        ;;
+        get-current-output-prev)
+            echo "${MSG_DIRECTIVES_PREV[*]}"
+        ;;
+        enable-timestamp)
+            MSG_TIMESTAMP_PREV=$MSG_TIMESTAMP
+            MSG_TIMESTAMP=1
+        ;;
+        disable-timestamp)
+            MSG_TIMESTAMP_PREV=$MSG_TIMESTAMP
+            MSG_TIMESTAMP=0
+        ;;
+        include-errors)
+            MSG_INCLUDE_ERRORS_PREV=$MSG_INCLUDE_ERRORS
+            MSG_INCLUDE_ERRORS=1
+        ;;
+        no-include-errors)
+            MSG_INCLUDE_ERRORS_PREV=$MSG_INCLUDE_ERRORS
+            MSG_INCLUDE_ERRORS=0
+        ;;
+        include-debug)
+            MSG_INCLUDE_DEBUG_PREV=$MSG_INCLUDE_DEBUG
+            MSG_INCLUDE_DEBUG=1
+        ;;
+        no-include-debug)
+            MSG_INCLUDE_DEBUG_PREV=$MSG_INCLUDE_DEBUG
+            MSG_INCLUDE_DEBUG=0
+        ;;
+        set-output)
+            if [ -n "$logFile" ]; then
+                install_null_file $logFile $logFilePermissions
+            fi
+
+            local oldIFS=$IFS msgDirective='' mIndex=-1
+            IFS=','; for t in $msgType
+            do
+                mIndex=$(get_msg_type_index $t)
+
+                if (( $readDirectives == 1 )); then
+                    MSG_DIRECTIVES_PREV[$mIndex]="$t|stdout"
+
+                    set_msg_output ${MSG_DIRECTIVES[$mIndex]}
+                else
+                    case "$t" in
+                        debug)
+                            (($stdout == 1)) \
+                                && { { (($debug == 1)) && msgDirective="$t|debug"; } \
+                                    || { [ -n "$debugFile" ] && msgDirective="$t|debug#file:${debugFile}"; } \
+                                    || { [ -n "$logFile" ] && msgDirective="$t|debug#file:${logFile}"; } \
+                                    || msgDirective="$t|"; } \
+                                || msgDirective="$t|"
+                        ;;
+                        *)
+                            (($stdout == 1)) \
+                                && { { [ -n "$logFile" ] && msgDirective="$t|#file:${logFile}"; } \
+                                    || { (($stdout == 1)) && msgDirective="$t|stdout"; }; } \
+                                || msgDirective="$t|"
+                        ;;
+                    esac
+
+                    MSG_DIRECTIVES_PREV[$mIndex]=${MSG_DIRECTIVES[$mIndex]}
+                    MSG_DIRECTIVES[$mIndex]=$msgDirective
+
+                    set_msg_output $msgDirective
+                fi
+            done
+            IFS=$oldIFS
+        ;;
+        reset-all)
+            MSG_TIMESTAMP=$MSG_TIMESTAMP_PREV
+        ;&
+        reset-output)
+            local oldIFS=$IFS mIndex=-1
+            IFS=','; for t in $msgType
+            do
+                mIndex=$(get_msg_type_index $t)
+
+                MSG_DIRECTIVES[$mIndex]=${MSG_DIRECTIVES_PREV[$mIndex]}
+
+		set_msg_output ${MSG_DIRECTIVES[$mIndex]}
+            done
+            IFS=$oldIFS
+        ;;
+        reset-timestamp)
+            MSG_TIMESTAMP=$MSG_TIMESTAMP_PREV
+        ;;
+        reset-include-errors)
+            MSG_INCLUDE_ERRORS=$MSG_INCLUDE_ERRORS_PREV
+        ;;
+        export-all)
+            export MSG_TIMESTAMP
+        ;&
+        export-output)
+            MSG_DIRECTIVES_SERIAL=''
+
+            local msgDirectivesLength=${#MSG_DIRECTIVES[@]}
+            for ((mIndex=0; mIndex < $msgDirectivesLength; mIndex++))
+            do
+                (($mIndex == 0)) && MSG_DIRECTIVES_SERIAL="$mIndex,${MSG_DIRECTIVES[$mIndex]}" \
+                    || MSG_DIRECTIVES_SERIAL="$MSG_DIRECTIVES_SERIAL;$mIndex,${MSG_DIRECTIVES[$mIndex]}"
+            done
+
+            export MSG_DIRECTIVES_SERIAL
+        ;;
+        export-timestamp)
+            export MSG_TIMESTAMP
+        ;;
+        export-includes)
+            export MSG_INCLUDE_ERRORS
+            export MSG_INCLUDE_DEBUG
+        ;;
+        export-include-errors)
+            export MSG_INCLUDE_ERRORS
+        ;;
+        export-include-debug)
+            export MSG_INCLUDE_DEBUG
+        ;;
+    esac
+} # => msg()
+
+# (function)
+cleanup_msg_fd() {
+    exec 10>&- #info
+    exec 11>&- #debug
+    exec 12>&- #warn
+    exec 13>&- #die
+    exec 14>&- #error
+} # => cleanup_msg_fd()
+
+MSG_TIMESTAMP_PREV=0
+[ -v MSG_TIMESTAMP ] || MSG_TIMESTAMP=0
+MSG_INCLUDE_ERRORS_PREV=0
+[ -v MSG_INCLUDE_ERRORS ] || MSG_INCLUDE_ERRORS=0
+MSG_INCLUDE_DEBUG_PREV=0
+[ -v MSG_INCLUDE_DEBUG ] || MSG_INCLUDE_DEBUG=0
+
+declare -a MSG_DIRECTIVES_PREV
+declare -a MSG_DIRECTIVES
+if [ -v MSG_DIRECTIVES_SERIAL ]; then
+    oldIFS=$IFS
+    IFS=';'; for directive in $MSG_DIRECTIVES_SERIAL
+    do
+        MSG_DIRECTIVES[${directive%,*}]="${directive#*,}"
+    done
+    IFS=$oldIFS
+    unset oldIFS
+
+    set_msg_directives 'debug' ''
+    msg set-output read-directives
+else
+    set_msg_directives 'debug,warn,error' ''
+    set_msg_directives 'info,die' 'stdout'
+    msg set-output type:'info,debug,warn,die,error' read-directives
+fi
+
+# (function args)
+# $1 - cleanup_fd
+cleanup_script_base() {
+    cleanup_tmp_dir
+    cleanup_msg_fd
+} # => cleanup_script_base()
+
+trap cleanup_script_base EXIT
+
+# (function args)
+# $1 - errorMsg
+error() {
+    local s=$?
+    (($MSG_TIMESTAMP == 1)) \
+        && print "$(current_time) $1" >&14 \
+        || print "$1" >&14
+    return $s
+} # => error()
+
+# (function args)
+# $1 - printFormat
+# $2+ - errorMsgVars
+perror() {
+    local s=$?
+    local pFmt="$1" && shift
+    (($MSG_TIMESTAMP == 1)) \
+        && print "$(current_time) $(printf "$pFmt" "$@")" >&14 \
+        || print "$(printf "$pFmt" "$@")" >&14
+    return $s
+} # => perror()
+
+# (function args)
+# $1 - dieMsg
+die() {
+    (($MSG_TIMESTAMP == 1)) \
+        && print "$(current_time) $1" >&13 \
+        || print "$1" >&13
+    prog_exit "${2:-1}"
+} # => die()
+
+# (function args)
+# $1 - printFormat
+# $2+ - dieMsgVars
+pdie() {
+    local pFmt="$1" && shift
+    (($MSG_TIMESTAMP == 1)) \
+        && print "$(current_time) $(printf "$pFmt" "$@")" >&13 \
+        || print "$(printf "$pFmt" "$@")" >&13
+    prog_exit "${2:-1}"
+} # => pdie()
+
+# (function args)
+# $1 - warningMsg
+warn() {
+    local s=$?
+    (($MSG_TIMESTAMP == 1)) \
+        && print "$(current_time) $1" >&12 \
+        || print "$1" >&12
+    return $s
+} # => warn()
+
+# (function args)
+# $1 - printFormat
+# $2+ - warningMsgVars
+pwarn() {
+    local s=$?
+    local pFmt="$1" && shift
+    (($MSG_TIMESTAMP == 1)) \
+        && print "$(current_time) $(printf "$pFmt" "$@")" >&12 \
+        || print "$(printf "$pFmt" "$@")" >&12
+    return $s
+} # => pwarn()
+
+# (function args)
+# $1 - debugMsg
+debug() {
+    local s=$?
+    (($MSG_TIMESTAMP == 1)) \
+        && echo "$(current_time) $1" >&11 \
+        || echo "$1" >&11
+    return $s
+} # => debug()
+
+# (function args)
+# $1 - printFormat
+# $2+ - debugMsgVars
+pdebug() {
+    local s=$?
+    local pFmt="$1" && shift
+    (($MSG_TIMESTAMP == 1)) \
+        && echo "$(current_time) $(printf "$pFmt" "$@")" >&11 \
+        || printf "$pFmt" "$@" >&11
+    return $s
+} # => pdebug()
+
+# (function args)
+# $1 - infoMsg
+info() {
+    local s=$?
+    (($MSG_TIMESTAMP == 1)) \
+        && echo "$(current_time) $1" >&10 \
+        || echo "$1" >&10
+    return $s
+} # => info()
+
+# (function args)
+# $1 - printFormat
+# $2+ - infoMsgVars
+pinfo() {
+    local s=$?
+    local pFmt="$1" && shift
+    (($MSG_TIMESTAMP == 1)) \
+        && echo "$(current_time) $(printf "$pFmt" "$@")" >&10 \
+        || printf "$pFmt" "$@" >&10
+    return $s
+} # => pinfo()
+
+# (function args)
+# $1 - errorMsg
+check_if_error_and_reset_msg() {
+    local s=$?
+    (($s != 0)) \
+        && error $*
+    msg reset-all
+    return $?
+} # => check_if_error_and_reset_msg()
+
+# (function args)
+# $1+ - perrorArgs
+check_if_perror_and_reset_msg() {
+    local s=$?
+    (($s != 0)) \
+        && perror $*
+    msg reset-all
+    return $?
+} # => check_if_perror_and_reset_msg()
+
+# (function args)
+# $1 - str
+replace_space_with_pipe() {
+    sed -r -e 's/\s/\|/g' <<<"$([ -n "$1" ] && echo "$@" || cat </dev/stdin)" 2>&14
+} # => replace_space_with_pipes()
+
+# (function args)
+# $1 -str
+replace_space_with_newline() {
+    sed -r -e "s/\s/${NEWLINE}/g" <<<"$([ -n "$1" ] && echo "$@" || cat </dev/stdin)" 2>&14
+} # => replace_space_with_newline()
+
+# (function args)
+# $1 - str
+replace_pipe_with_newline() {
+    sed -r -e "s/\|/${NEWLINE}/g" <<<"$([ -n "$1" ] && echo "$@" || cat </dev/stdin)" 2>&14
+} # => replace_pipe_with_newline()
+
+ACCEPTED_ARG_DELIMITERS=(':' '=')
+ACCEPTED_ARG_DELIMITERS_STR="$(replace_space_with_pipe "${ACCEPTED_ARG_DELIMITERS[*]}")"
+
+# (function args)
+# $1 - argTypes (pipe delimited string)
+# $2 - acceptedDelimiters (pipe delimited string)
+# $3 - argStr
+get_delimiter_type() {
+    { { [ -n "$1" ] && local argTypes="$1"; } || die 'No argTypes supplied'; } && shift
+    { { [ -n "$1" ] && local acceptedDelimiters="$1"; } || die 'No acceptedDelimiters supplied'; } && shift
+    local oldIFS=$IFS
+
+    IFS='|'; for argType in $argTypes
+    do
+        for delimiter in $acceptedDelimiters
+        do
+            if grep -q "^${argType}${delimiter}.*" <<<$@; then
+                echo "$delimiter"
+                IFS=$oldIFS
+                return 0
+            fi
+        done
+    done
+    IFS=$oldIFS
+
+    return 1
+} # => get_delimiter_type()
+
+# (function args)
+# $1 - argTypes (pipe delimited string)
+# $2 - argDelimiter
+# $3 - desiredArgType
+# $4 - argStr
+parse_multi_args() {
+    { { [ -n "$1" ] && local argTypes="$1"; } || die 'No argTypes supplied'; } && shift
+    { { [ -n "$1" ] && local argDelimiter="$1"; } || die 'No argDelmiter supplied'; } && shift
+    { { [ -n "$1" ] && local desiredArgType="$1"; } || die 'No desiredArgType supplied'; } && shift
+
+    local argVal=$(sed -rn -e "
+        /.*${desiredArgType}${argDelimiter}.+${RE_S}((${argTypes})${argDelimiter}.+){2,}/b mtiaftr
+        /.*${desiredArgType}${argDelimiter}.+${RE_S}((${argTypes})${argDelimiter}.+)/b oneaftr
+        s/.*${desiredArgType}${argDelimiter}(.+)/\1/p
+        :mtiaftr
+        s/.*${desiredArgType}${argDelimiter}(.+)${RE_S}((${argTypes})${argDelimiter}.+){2,}/\1/p
+        :oneaftr
+        s/.*${desiredArgType}${argDelimiter}(.+)${RE_S}((${argTypes})${argDelimiter}.+)/\1/p" \
+        <<<"$@" 2>&14)
+
+    [ -n "$argVal" ] \
+        && { { grep -q '\s$' <<<$argVal 2>&14 && echo "${argVal%${RE_S}}"; } || echo "${argVal}"; } \
+        || return 1
+} # => parse_multi_args()
+
+# (function args)
+# $1 - str
+input_contains() {
+    local count=0
+
+    while read -r line; do
+        if grep -Eq "^$1\$" <<<$line 2>&14; then echo $count; return 0; fi
+        let count=$count+1
+    done <&0
+
+    echo -1; return 1
+} # => input_contains()
+
+# (function args)
+# $1 - IFS
+# $2+ - desiredPropertiesInOrder
+# /dev/stdin - dataSet
+find_properties_in_set() {
+    { { ((${#1} == 1)) && local ifsChar=$1; } && shift; } || die "${FUNCNAME[0]}(): IFS argument may only be one character long"
+    [ ! -p /dev/stdin ] && die "${FUNCNAME[0]}(): needs to be fed a data-set via a pipe"
+
+    declare -a desiredProperties=($@)
+
+    local i=0 j=0 setCount=0 oldIFS=$IFS
+    local desiredProperty=''
+    while read -r dataSet; do
+        let setCount=$setCount+1
+
+        i=0 j=0
+        IFS=$ifsChar; for dataProperty in $dataSet
+        do
+            desiredProperty=${desiredProperties[$i]}
+            let i=$i+1
+            { [ "$desiredProperty" == "$dataProperty" ] && let j=$j+1 || break; }
+        done; IFS=$oldIFS
+        { (($i > 0)) && (($i == $j)); } && return 0
+    done </dev/stdin
+
+    (($setCount == 0)) && return 2 || return 1
+} # => find_properties_in_set()
+
+# (function args)
+# $1 - arrayName
+array_exists() {
+    if [ "$(declare -p $1 2>&14 | sed -r -e 's/(declare\s-a)(.+)/\1/' 2>&14)" == "declare -a" ]; then
+        return 0
+    fi
+
+    return 1
+} # => array_exists()
+
+# (function args)
+# $1 - arrayAddress
+get_address_index() {
+    cut -s -f1 -d, <<<"$([ -n "$1" ] && echo "$@" || cat </dev/stdin)"
+} # => get_address_index()
+
+# (function args)
+# $1 - arrayAddress
+get_address_key() {
+    cut -s -f2 -d, <<<"$([ -n "$1" ] && echo "$@" || cat </dev/stdin)"
+} # => get_address_key()
+
+# (function args)
+# $1 - str
+# $2 - arrayName
+array_contains() {
+    input_contains $1 < <(
+        [ ! -t 0 ] \
+            && print_args $(cat <&0) \
+            || { [ -n "$2" ] \
+                && {
+                    declare -n arrayRef="$2"
+                    printf "%s${NEWLINE}" "${arrayRef[@]}"
+                }; } \
+            || return 2
+    )
+} # => array_contains()
+
+# (function args)
+# $1 - str
+# $2 - arrayName
+old_array_contains() {
+    declare -n arrayRef="$2"
+
+    while read -r line; do
+        if grep -Eq "^$1\$" <<<$line 2>&14; then return 0; fi
+    done < <(printf '%s\n' "${arrayRef[@]}")
+
+    return 1
+} # => array_contains()
+
+# (function args)
+# $1 - value
+# $2 - arrayName
+array_value_location() {
+    declare -n arrayRef="$2"
+
+    declare -a locations
+    while read loc; do
+        locations+=($(expr $loc - 1))
+    done < <(
+        printf '%s\n' "${arrayRef[@]}" | grep -n -Eo "^$1\$" 2>&14 | \
+            sed -r -e 's/^([0-9]+):.+/\1/' 2>&14
+    )
+
+    ((${#locations[@]} > 0)) && echo ${locations[*]} || echo -1
+} # => array_value_location()
+
+# (function args)
+# $1 - arrayName
+print_array_properties() {
+    declare -n arrayRef=$1
+
+    paste -d= <(printf '%s\n' "${!arrayRef[@]}") <(printf '%s\n' "${arrayRef[@]}")
+} # => print_array_properties()
+
+# (function args)
+# $1 - value
+# $2 - delimiter
+# $3 - arrayName
+print_array_without_value() {
+    if [ -n "$3" ]; then
+        declare -n arr="$3"
+        local dontPrint="$(replace_space_with_pipe "$(array_value_location $3 $1)")"
+    else
+        declare -a arr
+        while read arrVal; do
+            arr+=("$arrVal")
+        done < <(replace_space_with_newline </dev/stdin)
+
+        local dontPrint="$(replace_space_with_pipe "$(array_value_location 'arr' $1)")"
+    fi
+
+    [ -n "$2" ] && local delimiter="$2" || local delimiter='\n'
+    {
+        local pCount=0
+        declare -i arrSize=${#arr[@]}
+        for ((i=0; i < arrSize; i++))
+        do
+            if (($i != $dontPrint)); then
+                if (($pCount > 0)); then
+                    printf "${delimiter}%s" "${arr[$i]}"
+                else
+                    printf "%s" "${arr[$i]}"
+                fi
+
+                let pCount=$pCount+1
+            fi
+        done
+    }
+} # => print_array_without_value()
+
+# (function args)
+# $1 - printTypes
+# $2 - printFormat
+generate_print_command() {
+    [ -n "$1" ] && local pTypes="$1" || die "No printTypes supplied"
+    { [ -n "$2" ] && local pCMD="printf '$2'"; } || { local pCMD='printf' && {
+        local oldIFS=$IFS pFmt=''
+
+        IFS=','; for printType in $pTypes
+        do
+            case "$printType" in
+                index)
+                    ! grep -q '%s,' <<<$pFmt 2>&14 && \
+                        pFmt="%s,${pFmt#,}"
+                ;;
+                key)
+                    ! grep -q ',%s' <<<$pFmt 2>&14 && \
+                        pFmt="$(cut -s -f1 -d, <<<$pFmt),%s$(cut -s -f2 -d= <<<$pFmt)"
+                ;;
+                value)
+                    ! grep -q '="%s"' <<<$pFmt 2>&14 && \
+                        pFmt="${pFmt%%\#*}=\"%s\"$(cut -s -f2 -d# <<<$pFmt)"
+                ;;
+                count)
+                    ! grep -q '#%s' <<<$pFmt 2>&14 && \
+                        pFmt="${pFmt}#%s"
+                ;;
+            esac
+
+            grep -Eq '.*,.*(="%s"|#%s)' <<<$pFmt 2>&14 && \
+                pFmt="[${pFmt%%+(=*|#*)}]${pFmt##+(*,\%s|\%s,)}"
+        done
+        IFS=$oldIFS
+
+        pFmt="'${pFmt}\n'"
+        pCMD="${pCMD} ${pFmt}"
+    }; }
+
+    local pVars='' t=''
+    while [ -n "$pTypes" ]; do
+        { grep -q ',' <<<$pTypes 2>&14 && t="${pTypes%%,*}" pTypes="${pTypes#*,}"; } || t="$pTypes" pTypes=''
+        [ -n "$t" ] && {
+            case "$t" in
+                index)
+                    ! grep -q 'index' <<<$pVars 2>&14 && \
+                        pVars="\"\$index\"${pVars}"
+                ;;
+                key)
+                    ! grep -q 'key' <<<$pVars 2>&14 && \
+                        pVars="$(sed -r -e 's/(\"\$index\")*(\"\$value\")*(\"\$count\")*/\1"\$key"\2\3/' <<<$pVars 2>&14)"
+                ;;
+                value)
+                    ! grep -q 'value' <<<$pVars 2>&14 && \
+                        pVars="$(sed -r -e 's/(\"\$index\")*(\"\$key\")*(\"\$count\")*/\1\2"\$value"\3/' <<<$pVars 2>&14)"
+                ;;
+                count)
+                    ! grep -q 'count' <<<$pVars 2>&14 && \
+                        pVars="$pVars\"\$count\""
+                ;;
+            esac
+        }
+    done
+
+    pCMD="$pCMD $(sed -r -e 's/([a-z]\")(\"\$)/\1 \2/g' <<<$pVars 2>&14)"
+
+    echo "$pCMD"
+} # => generate_print_command()
+
+# (function args)
+# $1 - printOutput
+# $2 - printFormat
+# $3 - index
+# $4 - value
+parse_find_array_value_for_index() {
+    { { [ -n "$1" ] && local pOutput="$1"; } || die "${FUNCNAME[0]}(): No printOutputTypes supplied"; } && shift
+    { { [ -n "$1" ] && local pFmt="$1"; } || die "${FUNCNAME[0]}(): No printFormat specified"; } && shift
+    { { [ -n "$1" ] && local forIndex="$1"; } || die "${FUNCNAME[0]}(): No array index specified"; } && shift
+    [ -z "$1" ] && die "${FUNCNAME[0]}(): No array value specified"
+
+    local pCMD="$(generate_print_command $pOutput $pFmt)"
+
+    local count=0 address='' index='' key='' value=''
+    while read line; do
+        address="${line%%=*}" value="${line#*=}"
+        index="${address%%,*}" key="${address#*,}"
+
+        if [ "$index" == "$forIndex" ]; then
+            [ "$value" == "$@" ] && eval $pCMD && return 0
+            let count=$count+1
+        fi
+    done </dev/stdin
+
+    return 1
+} # => parse_find_array_value_for_index()
+
+# (function args)
+# $1 - printOutput
+# $2 - printFormat
+# $3 - value
+parse_find_array_value() {
+    { { [ -n "$1" ] && local pOutput="$1"; } || die "${FUNCNAME[0]}(): No printOutputTypes supplied"; } && shift
+    { { [ -n "$1" ] && local pFmt="$1"; } || die "${FUNCNAME[0]}(): No printFormat specified"; } && shift
+    [ -z "$1" ] && die "${FUNCNAME[0]}(): No array value specified"
+
+    local pCMD="$(generate_print_command $pOutput $pFmt)"
+
+    local count=0 address='' index='' key='' value=''
+    while read line; do
+        address="${line%%=*}" value="${line#*=}"
+        index="${address%%,*}" key="${address#*,}"
+
+        [ "$value" == "$@" ] && eval $pCMD && return 0
+        let count=$count+1
+    done </dev/stdin
+
+    return 1
+} # => parse_find_array_value()
+
+# (function args)
+# $1 - printOutput
+# $2 - index
+parse_array_indicies() {
+    { { [ -n "$1" ] && local pOutput="$1"; } || die "${FUNCNAME[0]}(): No printOutputTypes supplied"; } && shift
+    { { [ -n "$1" ] && local forIndex="$1"; } || die "${FUNCNAME[0]}(): No array index specified"; } && shift
+
+    local pCMD="$(generate_print_command $pOutput)"
+
+    local count=0 address='' index='' key='' value=''
+    while read line; do
+        address="${line%%=*}" value="${line#*=}"
+        index="${address%%,*}" key="${address#*,}"
+
+        [ "$index" == "$forIndex" ] && eval $pCMD
+
+        let count=$count+1
+    done </dev/stdin
+} # => parse_array_indicies()
+
+# (function args)
+# $1 - printOutput
+# $2 - value
+parse_array_values() {
+    { { [ -n "$1" ] && local pOutput="$1"; } || die "${FUNCNAME[0]}(): No printOutputTypes supplied"; } && shift
+    [ -z "$1" ] && die "${FUNCNAME[0]}(): No array value specified"
+
+    local pCMD="$(generate_print_command $pOutput)"
+
+    local count=0 address='' index='' key='' value=''
+    while read line; do
+        address="${line%%=*}" value="${line#*=}"
+        index="${address%%,*}" key="${address#*,}"
+
+        if [ "$value" == "$@" ]; then
+            eval $pCMD
+        fi
+
+        let count=$count+1
+    done </dev/stdin
+} # => parse_array_values()
+
+# (function args)
+# $1 - printOutput
+# $2 - index
+# $3 - value
+parse_array_index_values() {
+    { { [ -n "$1" ] && local pOutput="$1"; } || die "${FUNCNAME[0]}(): No printOutputTypes supplied"; } && shift
+    { { [ -n "$1" ] && local forIndex="$1"; } || die "${FUNCNAME[0]}(): No array index specified"; } && shift
+    [ -z "$1" ] && die "${FUNCNAME[0]}(): No array value specified"
+
+    local pCMD="$(generate_print_command $pOutput)"
+
+    local count=0 address='' index='' key='' value=''
+    while read line; do
+        address="${line%%=*}" value="${line#*=}"
+        index="${address%%,*}" key="${address#*,}"
+
+        if [ "$index" == "$forIndex" ] && [ "$value" == "$@" ]; then
+            eval $pCMD
+        fi
+
+        let count=$count+1
+    done </dev/stdin
+} # => parse_array_index_values()
+
+# (function args)
+# $1 - printOutput
+parse_array() {
+    { { [ -n "$1" ] && local pOutput="$1"; } || die "${FUNCNAME[0]}(): No printOutputTypes supplied"; } && shift
+
+    local pCMD="$(generate_print_command $pOutput)"
+
+    local count=0 address='' index='' key='' value=''
+    while read line; do
+        address="${line%%=*}" value="${line#*=}"
+        index="${address%%,*}" key="${address#*,}"
+
+        eval $pCMD
+        let count=$count+1
+    done </dev/stdin
+} # => parse_array()
+
+# (function args)
+# $1 - arrayName
+# $2 - options
+print_array() {
+    { { [ -n "$1" ] && local arrayName="$1"; } || die "${FUNCNAME[0]}(): No arrayName specified"; } && shift
+
+    declare -n arrayRef=$arrayName
+
+    local output='' sortBy='' sortDirection=''
+    local opt='' val=''
+    for arg in "$@"
+    do
+        opt=$(get_arg_opt "$arg")
+        val=$(get_arg_val "$arg")
+
+        case "$opt" in
+            output)
+                output="$val"
+            ;;
+            sort-by)
+                sortBy="$val"
+            ;;
+            sort-direction)
+                sortDirection="$val"
+            ;;
+        esac
+    done
+
+    local fd_fifo="/$TMP_DIR/$(gen_rand_string 8)"
+    mkfifo $fd_fifo
+
+    paste -d= <(printf '%s\n' "${!arrayRef[@]}") <(printf '%s\n' "${arrayRef[@]}") >$fd_fifo &
+
+    local array_print="/$TMP_DIR/$(gen_rand_string 8)"
+
+    if [ -n "$sortBy" ]; then
+        case "$sortBy" in
+            addr)
+                if [ -n "$sortDirection" ] && [ "$sortDirection" == 'desc' ]; then
+                    sort -t ',' -k1 -n -r <$fd_fifo >$array_print
+                else
+                    sort -t ',' -k1 -n <$fd_fifo >$array_print
+                fi
+            ;;
+            val)
+                if [ -n "$sortDirection" ] && [ "$sortDirection" == 'desc' ]; then
+                    sort -t '=' -k2 -r <$fd_fifo >$array_print
+                else
+                    sort -t '=' -k2 <$fd_fifo >$array_print
+                fi
+            ;;
+        esac
+    else
+        cat <$fd_fifo >$array_print
+    fi
+
+    rm $fd_fifo
+
+    local pOpt_newline=0 pOpt_pretty=0
+    if [ -n "$output" ]; then
+        local oldIFS=$IFS
+
+        IFS=','; for outputOption in $output
+        do
+            case "$outputOption" in
+                newline)
+                    pOpt_newline=1
+                ;;
+                pretty)
+                    pOpt_pretty=1
+                ;;
+            esac
+        done
+        IFS=$oldIFS
+    fi
+
+    if (($pOpt_pretty == 1)); then
+        printf '%s=(' $arrayName
+
+        if (($pOpt_newline == 1)); then
+            cat <$array_print | sed -r -e "s/($RE_D,$RE_D)=(.+)/[\1]=\2/g" 2>&14
+        else
+            while read -r line; do
+                printf '%s ' $(sed -r -e "s/($RE_D,$RE_D)=(.+)/[\1]=\2/" <<<$line 2>&14)
+            done <$array_print
+        fi
+
+        printf ')\n'
+    else
+        if (($pOpt_newline == 1)); then
+            cat <$array_print
+        else
+            while read -r line; do
+                printf '%s ' $line
+            done <$array_print
+        fi
+    fi
+
+    rm $array_print
+} # => print_array()
+
+PARSE_ARRAY_ARG_TYPES=('find' 'index' 'output' 'sort' 'value')
+PARSE_ARRAY_ARG_TYPES_STR="$(replace_space_with_pipe "${PARSE_ARRAY_ARG_TYPES[*]}")"
+PARSE_ARRAY_PTYPES=('index' 'key' 'value' 'count')
+
+# (function args)
+# $1 - arrayName
+# $2+ - options
+associative_array() {
+    { { [ -n "$1" ] && local arrayName="$1"; } || die 'No associative array name specified'; } && shift
+
+    local delimiterType=''
+    if ! delimiterType=$(get_delimiter_type $PARSE_ARRAY_ARG_TYPES_STR $ACCEPTED_ARG_DELIMITERS_STR "$@"); then
+        die "No accepted arg types supplied. Accepted delimiters are: \"${ACCEPTED_ARG_DELIMITERS[*]}\""
+    fi
+
+    local opt_find='' opt_index='' opt_output='' opt_sort='' opt_value='' val=''
+    for opt in ${PARSE_ARRAY_ARG_TYPES[*]}
+    do
+        if val="$(parse_multi_args $PARSE_ARRAY_ARG_TYPES_STR $delimiterType $opt "$@")"; then
+            case "$opt" in
+                find)
+                    opt_find="$val"
+                ;;
+                index)
+                    opt_index="$val"
+                ;;
+                output)
+                    opt_output="$val"
+                ;;
+                sort)
+                    opt_sort="$val"
+                ;;
+                value)
+                    opt_value="$val"
+                ;;
+            esac
+        fi
+    done
+
+    if [ -n "$opt_find" ]; then
+        case "$opt_find" in
+            index-length)
+                if [ -z "$opt_index" ] || (($opt_index < 0)); then
+                    die "${FUNCNAME[0]}(): index option needed to find index length"
+                fi
+
+                declare -n arrayRef="$arrayName"
+
+                local k=${!arrayRef[@]}
+                local re="(\<$opt_index,[0-9]+)"
+
+                echo $k | grep -Eo $re | wc -l
+            ;;
+            largest-index)
+                print_array $arrayName output:newline sort-by:addr | \
+                    tail -n 1 | cut -s -f1 -d,
+            ;;
+            location)
+                if [ -n "$opt_value" ]; then
+                    if [ -n "$opt_index" ]; then
+                        print_array $arrayName output:newline | \
+                            parse_find_array_value_for_index index,key '%s,%s' "$opt_index" "$opt_value"
+                    else
+                        print_array $arrayName output:newline | \
+                            parse_find_array_value index,key '%s,%s' "$opt_value"
+                    fi
+                else
+                    die "${FUNCNAME[0]}(): value option needed to find array location"
+                fi
+            ;;
+        esac
+    else
+        if [ -z "$opt_output" ]; then
+            die "${FUNCNAME[0]}(): No printOutputTypes supplied"
+        fi
+
+        local array_print="/$TMP_DIR/$(gen_rand_string 8)"
+        if [ -n "$opt_sort" ]; then
+            local sortBy=${opt_sort%,*} sortDirection=${opt_sort#*,}
+            if [ "$sortDirection" != "$opt_sort" ]; then
+                print_array $arrayName output:newline sort-by:$sortBy sort-direction:$sortDirection >$array_print
+            else
+                print_array $arrayName output:newline sort-by:$sortBy >$array_print
+            fi
+        else
+            print_array $arrayName output:newline >$array_print
+        fi
+
+        if [ -z "$opt_value" ]; then
+            if [ -z "$opt_index" ]; then
+                parse_array $opt_output <$array_print
+            else
+                parse_array_indicies $opt_output $opt_index <$array_print
+            fi
+        else
+            if [ -n "$opt_index" ]; then
+                parse_array_index_values $opt_output $opt_index $opt_value <$array_print
+            else
+                parse_array_values $opt_output $opt_value <$array_print
+            fi
+        fi
+
+        rm $array_print
+    fi
+} # => associative_array()
+
+# (function args)
+# $1+ - params_Key/DefaultVal
+parse_args() {
+    local pri_type='' pri_val=-1
+    local pri_default=0 pri_stdin=2 pri_supplied=1
+    grep -Eq 'PRI:\[.+\]' <<<"$@" \
+        && {
+            while read -d$RE_FS -r priInfo; do
+                pri_type=${priInfo%:*}
+                pri_val=${priInfo#*:}
+
+               case "$pri_type" in
+                    DEFLT) pri_default=$pri_val;;
+                    STDIN) pri_stdin=$pri_val;;
+                    SUPLD) pri_supplied=$pri_val;;
+                esac
+            done < <(sed -r -ne "s/.*PRI:\[(.+)\].*/\1$RE_FS/; s/,/$RE_FS/gp" <<<"$@")
+
+            local paramArgs=$(IFS=$RE_US; sed -r -e 's/(.+)*(PRI:\[.+\])(.+)*/\1\3/' <<<"$*")
+        } || {
+            local oldIFS=$IFS
+            IFS=$RE_US
+            local paramArgs="$*"
+            IFS=$oldIFS
+        }
+
+    declare -a suppliedArgs
+    declare -a paramNames
+
+    declare -A params
+
+    local p_name='' p_val='' emptyOk=0
+    local opt_del=$'\n'
+    while read -d$RE_US -r paramArg; do
+        emptyOk=0
+        p_name=$(get_arg_opt "$paramArg")
+        p_val=$(get_arg_val "$paramArg")
+
+        case "$p_name" in
+            DEL)
+                opt_del="$p_val"
+            ;;
+            SUP)
+                while read -d$RE_FS -r suppliedArg; do
+                    suppliedArgs+=("$suppliedArg")
+                done < <(sed -r -ne "s/\s/$RE_FS/g; s/^(.+)$/\1$RE_FS/p" <<<"$p_val")
+            ;;
+            *)
+                emptyOk=1
+                paramNames+=($p_name)
+                { [ "$p_val" = "$paramArg" ] || [ -z "$p_val" ]; } \
+                    && params[$pri_default,$p_name]='' \
+                    || params[$pri_default,$p_name]="$p_val"
+            ;;
+        esac
+
+        if (($emptyOk == 0)) && { [ "$p_val" = "$paramArg" ] || [ -z "$p_val" ]; }; then
+            print "${FUNCNAME[0]}(): Missing value for paramArg:'$p_name'" 1>&2
+            prog_exit "${2:-1}"    # <-------------------THIS PRY DOESN'T FIT THIS CONTEXT-------------
+        fi
+    done <<<"$paramArgs"
+
+    if [ ! -t 0 ]; then
+        p_name='' p_val=''
+        while read -d"$opt_del" -r stdinParam; do
+            p_name=$(get_arg_opt "$stdinParam")
+
+            if array_contains $p_name <<<"${paramNames[@]}" >/dev/null; then
+                p_val=$(get_arg_val "$stdinParam")
+
+                params[$pri_stdin,$p_name]="$p_val"
+            fi
+        done <&0
+    else
+        unset params[$pri_stdin]
+    fi
+
+    if ((${#suppliedArgs[@]} > 0)); then
+        p_name='' p_val=''
+        for suppliedArg in "${suppliedArgs[@]}"
+        do
+            p_name=$(get_arg_opt "$suppliedArg")
+            p_val=$(get_arg_val "$suppliedArg")
+
+            params[$pri_supplied,$p_name]="$p_val"
+        done
+    else
+        unset params[$pri_supplied]
+    fi
+
+    p_name='' p_val=-1
+    pri_type='' pri_val=''
+    while read -r paramInfo; do
+        pri_type=${paramInfo%%=*}
+        pri_val=${pri_type%%,*}
+        p_name=${pri_type#*,}
+        p_val=${paramInfo#*=}
+
+        if array_contains $p_name <<<"${paramNames[@]}" >/dev/null && [ -n "${params[$pri_val,$p_name]}" ]; then
+            eval "${p_name}='${params[$pri_val,$p_name]}'"
+        fi
+    done < <(print_array_properties 'params' | sort -t ',' -k1 -n -r)
+} # => parse_args()
+
+[ ! -v CONFIG_BASE ] && CONFIG_BASE=$GBL_SYS_LIB_DIR
+
+# (function args)
+# $1 - configFileName
+source_config() {
+    CONFIG_FILE_LOCATION="$CONFIG_BASE/$1"
+    if [ -f "$CONFIG_FILE_LOCATION" ]; then
+        CONFIG_FILE_NAME="$1"
+        source "$CONFIG_FILE_LOCATION"
+        return 0
+    fi
+
+    return 1
+} # => source_config()
+
+# (function args)
+# $1 - configFileName
+# $2+ - paramNames
+serialize_source_config() {
+    [ -n "$1" ] && { local configFileName="$1"; shift; }
+
+    if source_config $configFileName; then
+        for paramName in "$@"
+        do
+            array_exists $paramName \
+                && {
+                    declare -n arrayRef=$paramName
+                    printf "%s=(%s)$RE_FS" ${paramName} "${arrayRef[*]}"
+                } || printf "${paramName}=${!paramName}$RE_FS"
+        done
+
+        return 0
+    fi
+
+    return 1
+} # => serialize_source_config()
+
+# (function args)
+# $1 - valName
+# $2 - val
+check_val() {
+    if [ -z "$2" ]; then
+        die "Missing value: $1"
+#        return 1
+    fi
+} # => check_val()
+
+# (function args)
+# $1 - devName
+is_dev_configured() {
+    file_contains_line $DEV_SYS_CONFIGURED_DEVS_FILE $1
+
+    return $?
+} # => is_dev_configured()
+
+# (function args)
+# $1 - devName
+is_dev_available() {
+    file_contains_line $DEV_SYS_AVAIL_DEVS_FILE $1
+
+    return $?
+} # => is_dev_available()
+
+# (function args)
+# $1 - devName
+# $2 - timeToWait (seconds)
+# $3 - pollingInterval (seconds)
+wait_till_dev_available() {
+    [ -n "$1" ] && local devName="$1" || die "${FUNCNAME[0]}(): devName required"
+    [ -n "$2" ] && { (($2 == 0)) && local timeToWait=1 || local timeToWait=$2; } || local timeToWait=10
+    [ -n "$3" ] && local pollingInterval="$3" || local pollingInterval='1'
+
+    local endTime=0
+    let endTime=$SECONDS+$timeToWait
+    while (($SECONDS < $endTime))
+    do
+        is_dev_available $devName
+	(($? == 0)) \
+            && echo "$((($SECONDS-($endTime-$timeToWait))))s" && return 0
+
+        sleep $pollingInterval
+    done
+
+    echo "${timeToWait}s"
+    return 1
+} # => wait_till_dev_available()
+
+# (function args)
+# $1 - devName
+read_available_devs() {
+    while read -r availDev; do
+        if [ -n "$1" ]; then
+            [ "$1" == "$availDev" ] && echo "$availDev"
+        else
+            echo "$availDev"
+        fi
+    done <$DEV_SYS_AVAIL_DEVS_FILE
+} # => read_available_devs()
+
+# (function args)
+# $1 - devName
+dev_exists() {
+    ip link show $1 >/dev/null 2>&14
+
+    return $?
+} # => dev_exists()
+
+# (function args)
+# $1 - devName
+is_dev_up() {
+    grep -Eq '<(.+,)*UP(,.+)*>' < <(ip link show $1 2>&14) 2>&14
+
+    return $?
+} # => is_dev_up()
+
+# (function args)
+# $1 - dev
+get_dev_IP() {
+    local devIP=''
+    ! devIP="$(ip address show $1 2>&14 | sed -r \
+        -e '/inet\s/ !d' \
+        -e "s/(.+inet\s)($RE_IP)(\/.+)/\2/" 2>&14)" && return $?
+
+    [ -n "$devIP" ] && echo "$devIP" || return 1
+} # => get_dev_IP()
+
+# (function args)
+# $1 - dev
+# $2 - tableName
+get_dev_gw_IP() {
+    [ -n "$2" ] && local tableName="$2" || local tableName='main'
+
+    local devGWIP=''
+    ! devGWIP="$(ip route show table $tableName 2>&14 | sed -r \
+        -ne "s/default\svia\s($RE_IP)\sdev\s($1)(\s(.+)*src\s($RE_IP)|.+)*(\smetric.+)*/\1/p" 2>&14)" && return $?
+
+    [ -n "$devGWIP" ] && echo "$devGWIP" || return 1
+} # => get_dev_gw_IP()
+
+# (function args)
+# $1 - dev
+get_dev_CDIR() {
+    local devCDIR=''
+    ! devCDIR="$(ip address show $1 2>&14 | sed -r \
+        -e '/inet\s/ !d' \
+        -e "s/(.+inet\s)($RE_CDIR)(\sbrd.+)/\2/" 2>&14)" && return $?
+
+    [ -n "$devCDIR" ] && echo "$devCDIR" || return 1
+} # => get_dev_CDIR()
+
+# (function args)
+# $1 - CDIR
+get_net_CDIR() {
+    local netCDIR=''
+    ! netCDIR="$(ipcalc $1 2>&14 | awk '$1 == "Network:" { print $2 }' 2>&14)" && return $?
+
+    [ -n "$netCDIR" ] && echo "$netCDIR" || return 1
+} # => get_net_CDIR()
+
+# (function args)
+# $1 - CDIR
+get_broadcast_IP() {
+    local broadcastIP=''
+    ! broadcastIP="$(ipcalc $1 2>&14 | awk '$1 == "Broadcast:" { print $2 }' 2>&14)" && return $?
+
+    [ -n "$broadcastIP" ] && echo "$broadcastIP" || return 1
+} # => get_broadcast_IP()	
+
+# (function args)
+# $1 - dev
+get_net_CDIR_from_dev() {
+    ! get_net_CDIR $(get_dev_CDIR $1) && return 1
+} # => get_net_CDIR_from_dev()
+
+# (function args)
+# $1 - tableName
+# $2 - routeIdentifier
+# $3 - devName
+# $4 - viaIP (optional)
+route_contains_src() {
+    local re_routeID='default\svia\s(#)'
+
+    [ "$2" == 'default' ] \
+        && { [ -n "$4" ] \
+            && re_routeID="${re_routeID/\#/$(escape_slashes $4)}" \
+            || re_routeID="${re_routeID/\#/$RE_IP}"; } \
+        || re_routeID="($(escape_slashes $2))"
+
+    local routeInfo=''
+    ! routeInfo="$(ip route show table $1 2>&14 | sed -r \
+        -ne "s/${re_routeID}\sdev\s($3)(\s(.+)*src\s($RE_IP)|.+)*(\smetric.+)*/\2|\5/p" 2>&14)" && return $?
+
+    [ -n "$routeInfo" ] \
+        && { grep -Eq "^$RE_IP\$" <<<"${routeInfo#*|}" 2>&14 && return 0 || return 1; } \
+        || return 2
+} # => route_contains_src()
+
+# (function args)
+# $1 - rulesetName
+is_ruleset_loaded() {
+    file_contains_line $RULESETS_SYS_LOADED_RULESETS_FILE $1
+
+    return $?
+} # => is_ruleset_loaded()
+
+# (function)
+get_netsys_scripts() {
+    find $localDir/netsys-* -type f | \
+        sed -e "/$SCRIPT_NAME/d"
+} # => get_netsys_scripts()
+
+# (function)
+is_init() {
+    [ -d "$GBL_SYS_RUN_DIR" ] && return 0 || return 1
+} # is_init()
+
+# (function)
+init_sys() {
+    if create_dir $GBL_SYS_RUN_DIR 750; then
+        install_null_file $GBL_SYS_IGNORE_DEVS_FILE 640
+
+        tr '\n' '\174' <<<$GBL_SYS_IGNORE_DEVS_VAL | sed -r -e 's/(.+)\|/\1/' >>$GBL_SYS_IGNORE_DEVS_FILE
+
+        while read -r netsysScript; do
+		echo "initializing:$netsysScript"
+            $netsysScript init
+	    #1>/dev/null 2>&1
+        done < <(get_netsys_scripts)
+
+        return 0
+    fi
+
+    return 1
+} # init_sys()
+
+OPT_LIB=0
+
+while :; do
+    emptyOk=0
+    opt=$(get_arg_opt "$1")
+    val=$(get_arg_val "$1")
+
+    case "$opt" in
+        --lib)
+            OPT_LIB=1
+            emptyOk=1
+        ;;
+        *)
+            break
+        ;;
+    esac
+
+    if (($emptyOk == 0)) && { [ -n "$val" = "$1" ] || [ -z "$val" ]; }; then
+        die "Missing value to option:'$opt'"
+    fi
+
+    shift
+done
+
+{ [ -n "$1" ] && cmd="$1" || { (($OPT_LIB == 0)) && die 'No command specified'; }; } && shift;
+case "$cmd" in
+    is_init)
+        is_init
+    ;;
+    init)
+        init_sys
+    ;;
+    *)
+        (($OPT_LIB == 0)) && die "Unkown command:'$cmd'"
+    ;;
+esac

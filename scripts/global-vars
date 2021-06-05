@@ -1,0 +1,41 @@
+#!/bin/sh
+localDir=$(dirname $0)
+
+export GBL_LOG_FILE_PERMISSIONS=640
+export GBL_SYS_LIB_DIR='/usr/lib/netsys'
+export GBL_SYS_RUN_DIR='/run/netsys'
+export GBL_SYS_IGNORE_DEVS_FILE="$GBL_SYS_RUN_DIR/ignore-devs"
+[ -v GBL_SYS_IGNORE_DEVS_VAL ] || export GBL_SYS_IGNORE_DEVS_VAL=''
+
+# [RULESETS_SYS]
+export RULESETS_SYS_READY_FOR_DEV_WAIT_SECONDS=30
+export RULESETS_SYS_SCRIPT="$localDir/netsys-rulesets"
+export RULESETS_SYS_CONF_DIR="$GBL_SYS_LIB_DIR/rulesets"
+export RULESETS_SYS_RUN_DIR="$GBL_SYS_RUN_DIR/rulesets"
+export RULESETS_SYS_LOADED_RULESETS_FILE="$RULESETS_SYS_RUN_DIR/loadedRulesets"
+
+# [DEV_SYS]
+#export DEV_SYS_ROUTING_WAIT_SECONDS=30
+export DEV_SYS_SCRIPT="$localDir/netsys-dev"
+export DEV_SYS_LIB_DIR="$GBL_SYS_LIB_DIR/dev"
+export DEV_SYS_UPSTREAM_DEVS_FILE="$DEV_SYS_LIB_DIR/upstreamDevs"
+export DEV_SYS_RUN_DIR="$GBL_SYS_RUN_DIR/dev"
+export DEV_SYS_CONFIGURED_DEVS_FILE="$DEV_SYS_RUN_DIR/configuredDevs"
+export DEV_SYS_DISMANTLED_DEVS_FILE="$DEV_SYS_RUN_DIR/dismantledDevs"
+export DEV_SYS_AVAIL_DEVS_FILE="$DEV_SYS_RUN_DIR/availDevs"
+export DEV_SYS_DOWN_DEVS_FILE="$DEV_SYS_RUN_DIR/downDevs"
+export DEV_SYS_UPSTREAM_CONFIGURED_FILE="$DEV_SYS_RUN_DIR/upstreamConfigured"
+export DEV_SYS_UPSTREAM_ROUTED_FILE="$DEV_SYS_RUN_DIR/upstreamRouted"
+
+# [FIREWALL_SYS]
+export FIREWALL_SYS_SCRIPT="$localDir/netsys-firewall"
+export FIREWALL_SYS_LIB_DIR="$GBL_SYS_LIB_DIR/firewall"
+export FIREWALL_SYS_RUN_DIR="$GBL_SYS_RUN_DIR/firewall"
+export FIREWALL_SYS_ACTIVE_FWS_FILE="$FIREWALL_SYS_RUN_DIR/activeFWs"
+export FIREWALL_SYS_INACTIVE_FWS_FILE="$FIREWALL_SYS_RUN_DIR/inactiveFWs"
+
+# [VPN_SYS]
+export VPN_SYS_WAIT_FOR_DEV_SECONDS=30
+export VPN_SYS_SCRIPT="$localDir/netsys-vpn"
+export VPN_SYS_LIB_DIR="$GBL_SYS_LIB_DIR/vpn"
+export VPN_SYS_RUN_DIR="$GBL_SYS_RUN_DIR/vpn"

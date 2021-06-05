@@ -1,0 +1,467 @@
+#!/bin/bash
+
+localDir=$(dirname $0)
+
+source $localDir/netsys-base --lib
+
+DEV_TYPE='l2tap-bridge'
+
+# (function)
+init_folders_and_files() {
+    create_dir $VPN_SYS_RUN_DIR 750
+} # => init_folders_and_files()
+
+# (function args)
+# $1 - mtu
+set_default_config_mtu() {
+    if [ -z "$VPN_SYS_MTU" ]; then
+        VPN_SYS_MTU=$1
+    fi
+} # => set_default_config_mtu()
+
+check_tap_device_directive() {
+    if [ -z "$VPN_SYS_TAP_DEV" ]; then
+        die "Error: No --tap device directive set."
+    fi
+} # => check_tap_device_directive()
+
+check_all_device_directives() {
+    check_tap_device_directive
+    if [ -z "$VPN_SYS_BR_DEV" ]; then
+        die "Error: No --br device directive set."
+    fi
+} # -> check_all_device_directives()
+
+check_name_directive() {
+    if [ -z "$VPN_SYS_NAME" ]; then
+        die "Error: No --name directive set."
+    fi
+} # => check_name_directive()
+
+# (function args)
+# $1 - vpnName
+get_log_file_location() {
+    echo "$VPN_SYS_RUN_DIR/${1}_output"
+} # => get_log_file_location()
+
+# (function args)
+# $1 - VPN_SYS_NAME
+write_conf_file() {
+    if [ ! -d "$VPN_SYS_RUN_DIR" ]; then
+        mkdir -m 750 $VPN_SYS_RUN_DIR
+    fi
+
+    if [ ! -f "$VPN_SYS_RUN_DIR/$1" ]; then
+        echo "#!/bin/sh
+VPN_SYS_TAP_DEV=$VPN_SYS_TAP_DEV
+VPN_SYS_BR_DEV=$VPN_SYS_BR_DEV
+VPN_SYS_MTU=$VPN_SYS_MTU
+VPN_SYS_DHCP_BLOCK=$VPN_SYS_DHCP_BLOCK" > $VPN_SYS_RUN_DIR/$1
+        chmod 750 $VPN_SYS_RUN_DIR/$1
+    fi
+} # => write_conf_file()
+
+# (function args)
+# $1 - VPN_SYS_NAME
+delete_conf_file() {
+    if [ -f "$VPN_SYS_RUN_DIR/$1" ]; then
+        rm $VPN_SYS_RUN_DIR/$1
+    fi
+} # => delete_conf_file()
+
+# (function args)
+# $1 - VPN_SYS_NAME
+source_run_configs() {
+    if [ -f "$VPN_SYS_RUN_DIR/$1" ]; then
+        source $VPN_SYS_RUN_DIR/$1
+    else
+        die "Error: No $VPN_SYS_RUN_DIR/$VPN_SYS_NAME configuration file found."
+    fi
+} # => source_run_configs()
+
+# (function args)
+# $1 - vpnConfigName
+has_vpn_config() {
+    [ -f "$VPN_SYS_LIB_DIR/$1" ] && return 0
+
+    return 1
+} # => has_vpn_config()
+
+# (function args)
+# $1 - vpnConifgName
+source_vpn_config() {
+    unset vpnName enabled
+    unset devRequired devName devType devBridge devMTU
+    unset fwConfig fwVars
+
+    if has_vpn_config "$1"; then
+        source $VPN_SYS_LIB_DIR/$1
+        return 0
+    fi
+
+    return 1
+} # => source_vpn_config()
+
+# (function)
+get_vpn_config_names() {
+    if [ ! -d "$VPN_SYS_LIB_DIR" ]; then
+        die "Error: $VPN_SYS_LIB_DIR hasn't been initialized yet. No VPN configs"
+    fi
+
+    find $VPN_SYS_LIB_DIR -type f | sed -r \
+        -e 's/.+\/(.+)/\1/'
+} # => get_vpn_config_names()
+
+# (function args)
+# $1 - devRequired
+get_vpn_config_names_for_required_dev() {
+    while read -r vpnConfigName; do
+        source_vpn_config $vpnConfigName
+
+        [ -z "$devRequired" ] && continue
+        [ "$1" == "$devRequired" ] && echo "$name"
+    done < <(get_vpn_config_names)
+} # => get_vpn_config_names_for_required_dev()
+
+# (function args)
+# $1 - devRequired
+vpns_exist_for_required_dev() {
+    [ -z "$1" ] && die "${FUNCNAME[0]}(): No required-dev specified"
+
+    while read -r vpnConfigName; do
+        source_vpn_config $vpnConfigName
+
+        [ -z "$devRequired" ] && continue
+        [ "$1" == "$devRequired" ] && return 0
+    done < <(get_vpn_config_names)
+
+    return 1
+} # => vpns_exist_for_required_dev()
+
+# (function args)
+# $1 - fwConfigFileLocation
+# $2 - fwVars
+parse_vpn_fw() {
+    if [ ! -f "$1" ]; then
+        die "${FUNCNAME[0]}(): No firewall configuration at: $1 to parse"
+    fi
+
+    local fwFile=$(create_tmp_file)
+
+    cat $1 >$fwFile
+
+    if [ -n "$2" ]; then
+        local oldIFS=$IFS fwVarName='' replaceWith='' replaceVarName=''
+        IFS=','; for fwVar in $2
+        do
+            fwVarName=${fwVar%|*} replaceWith=${fwVar#*|}
+            if grep -q "%{$fwVarName}" <$fwFile; then
+                if grep -Eq '%{.+}' <<<"$replaceWith"; then
+                    replaceVarName=$(sed -r -e 's/%\{(.+)\}/\1/' <<<"$replaceWith")
+
+                    [ -n "${!replaceVarName}" ] \
+                        && replaceWith=${!replaceVarName} \
+                        || {
+                            warn "Cannot replace var: '$fwVarName' with '$replaceVarName' in config file: $1"
+                            continue
+                        }
+                fi
+
+                sed -i -r -e "s/%\{$fwVarName\}/$replaceWith/g" $fwFile
+            else
+                warn "var: '$fwVarName' not found in config file: $1"
+                continue
+            fi
+        done
+        IFS=$oldIFS
+    fi
+
+    cat $fwFile
+    rm $fwFile
+} # => parse_vpn_fw()
+
+# (function args)
+# $1 - cmd
+# $2+ - options
+vpn() {
+    { { [ -n "$1" ] && local cmd="$1"; } || die "${FUNCNAME[0]}(): No command specified"; } && shift
+
+    local opt='' val='' emptyOk=0
+    local opt_vpnName=''
+    local opt_devName='' opt_devType='' opt_devBridge='' opt_devMTU='' opt_devRequired=''
+    local opt_fwConfig='' opt_fwVars=''
+    local opt_log=0 opt_logFile=''
+    for arg in "$@"
+    do
+        emptyOk=0
+        opt=$(get_arg_opt "$arg")
+        val=$(get_arg_val "$arg")
+
+        case "$opt" in
+            name)
+                opt_vpnName="$val"
+            ;;
+            dev)
+                opt_devName="$val"
+            ;;
+            dev-type)
+                opt_devType="$val"
+            ;;
+            dev-bridge)
+                opt_devBridge="$val"
+            ;;
+            dev-mtu)
+                opt_devMTU="$val"
+            ;;
+            dev-required)
+                opt_devRequired="$val"
+            ;;
+            fw-config)
+                opt_fwConfig="$val"
+            ;;
+            fw-vars)
+                opt_fwVars="$val"
+            ;;
+            log)
+                { [ "$val" = "$arg" ] || [ -z "$val" ]; } \
+                    && opt_log=1 || opt_logFile="$val"
+                emptyOk=1
+            ;;
+        esac
+
+        if (($emptyOk == 0)) && { [ "$val" = "$arg" ] || [ -z "$val" ]; }; then
+            die "${FUNCNAME[0]}(): Missing value to option: $opt"
+        fi
+    done
+
+    case "$cmd" in
+        setup|teardown)
+            [ -z "$opt_vpnName" ] && die "${FUNCNAME[0]}(): option: 'name' required for command: '$cmd'"
+
+            source_vpn_config $opt_vpnName || local enabled=1 name="$opt_vpnName"
+
+            (($enabled != 1)) && return 1
+
+            { [ -n "$opt_logFile" ] && local logFile="$opt_logFile" \
+                || { (($opt_log == 1)) && local logFile="$(get_log_file_location $name)"; }
+            } && {
+                msg set-output file:$logFile permissions:$GBL_LOG_FILE_PERMISSIONS
+                msg enable-timestamp
+            }
+
+            { local vpn_devName=$(get_either $devName $opt_devName) s=$? && (($s == 0)); } \
+                || die "${FUNCNAME[0]}(): option: 'dev' required for command: '$cmd'"
+            { local vpn_devType=$(get_either $devType $opt_devType) s=$? && (($s == 0)); } \
+                || die "${FUNCNAME[0]}(): option: 'dev-type' required for command '$cmd'"
+            { local vpn_devMTU=$(get_either $devMTU $opt_devMTU) s=$? && (($s == 0)); } \
+                || local vpn_devMTU='1500'
+
+            case "$vpn_devType" in
+                l2tap-bridge)
+                    case "$cmd" in
+                        setup)
+                            { local vpn_devBridge=$(get_either $devBridge $opt_devBridge) s=$? && (($s == 0)); } \
+                                || die "${FUNCNAME[0]}(): option: 'dev-bridge' required for dev-type: '$vpn_devType'"
+                        ;;
+                    esac
+                ;;
+            esac
+
+            { local vpn_fwConfig=$(get_either $fwConfig $opt_fwConfig) s=$? && (($s == 0)); } \
+                || local vpn_fwConfig=''
+            { local vpn_fwVars=$(get_either $fwVars $opt_fwVars) s=$? && (($s == 0)); } \
+                || local vpn_fwVars=''
+        ;;&
+        setup)
+            info "Setting up vpn: $name network configuration"
+
+            case "$vpn_devType" in
+                l2tap-bridge)
+                    $DEV_SYS_SCRIPT setup log:$logFile dev:$vpn_devName \
+                        type:$vpn_devType bridge:$vpn_devBridge mtu:$vpn_devMTU >/dev/null 2>&1
+                    if wait_till_dev_available $vpn_devBridge $VPN_SYS_WAIT_FOR_DEV_SECONDS; then
+                        [ -n "$vpn_fwConfig" ] \
+                            && parse_vpn_fw $vpn_fwConfig $vpn_fwVars | \
+                                $DEV_SYS_SCRIPT up with-firewall log:$logFile dev:$vpn_devName \
+                                type:$vpn_devType bridge:$vpn_devBridge mtu:$vpn_devMTU >/dev/null 2>&1 \
+                            || $DEV_SYS_SCRIPT up log:$logFile dev:$vpn_devName \
+                                type:$vpn_devType bridge:$vpn_devBridge mtu:$vpn_devMTU >/dev/null 2>&1
+                    else
+                        warn "Not setting up vpn: $name network configuration, bridge: $vpn_devBridge not available"
+                    fi
+                ;;
+            esac
+        ;;&
+        teardown)
+            info "Tearing down vpn: $name network configuration"
+
+            case "$vpn_devType" in
+                l2tap-bridge)
+                    if [ -n "$vpn_fwConfig" ]; then
+                        parse_vpn_fw $vpn_fwConfig $vpn_fwVars | \
+                            $DEV_SYS_SCRIPT down log:$logFile dev:$vpn_devName \
+                                type:$vpn_devType with-firewall >/dev/null 2>&1
+                    else
+                        $DEV_SYS_SCRIPT down log:$logFile dev:$vpn_devName \
+                            type:$vpn_devType >/dev/null 2>&1
+                    fi
+
+                    $DEV_SYS_SCRIPT dismantle log:$logFile dev:$vpn_devName \
+                        type:$vpn_devType >/dev/null 2>&1
+                ;;
+            esac
+        ;;&
+        setup|teardown)
+            [ -n "$logFile" ] && msg reset-all
+        ;;
+        setup-all-for|teardown-all-for)
+            [ -z "$opt_devName" ] && die "${FUNCNAME[0]}(): option: 'dev' required for command: '$cmd'"
+
+            { [ -n "$opt_logFile" ] && local logFile="$opt_logFile"; } \
+            && {
+                msg set-output file:$logFile permissions:$GBL_LOG_FILE_PERMISSIONS
+                msg enable-timestamp
+            }
+        ;;&
+        setup-all-for)
+            local systemCtlCMD='start'
+        ;;&
+        teardown-all-for)
+            local systemCtlCMD='stop'
+        ;;&
+        setup-all-for|teardown-all-for)
+            local vpnStatus=-1
+            while read -r vpnConfigName; do
+                systemctl status openvpn-server@$vpnConfigName >/dev/null
+                vpnStatus=$?
+
+                case "$systemCtlCMD" in
+                    start)
+                        if (($vpnStatus != 3)); then
+                            warn "Cannot start vpnName: '$vpnConfigName' because service has status: '$vpnStatus'"
+                            continue
+                        fi
+                    ;;
+                    stop)
+                        if (($vpnStatus != 0)); then
+                            warn "Cannot stop vpnName: '$vpnConfigName' because service has status: '$vpnStatus'"
+                            continue
+                        fi
+                    ;;
+                esac
+
+                systemctl $systemCtlCMD openvpn-server@$vpnConfigName
+
+                echo "$vpnConfigName"
+            done < <(get_vpn_config_names_for_required_dev "$opt_devName")
+
+            [ -n "$logFile" ] && msg reset-all
+        ;;
+    esac
+} # => vpn()
+
+# (function args)
+# $1 - devRequired
+reload_all_vpn_nft_rules() {
+    while read -r vpnConfigName; do
+        vpn teardown name:$vpnConfigName
+        vpn setup name:$vpnConfigName
+    done < <(
+        if [ -n "$1" ]; then
+            get_vpn_config_names_for_required_dev "$1"
+        else
+            get_vpn_config_names
+        fi
+    )
+} # => reload_all_vpn_nft_rules()
+
+[ -v OPT_DEBUG ] || OPT_DEBUG=0
+[ -v OPT_DEBUG_FILE ] || OPT_DEBUG_FILE=''
+
+[ -v OPT_ERRORS ] || OPT_ERRORS=0
+[ -v OPT_ERRORS_FILE ] || OPT_ERRORS_FILE=''
+
+while :; do
+    emtpyOk=0
+    opt=$(get_arg_opt "$1")
+    val=$(get_arg_val "$1")
+
+    case "$opt" in
+        --debug)
+            { [ -n "$val" ] && [ "$val" != "$1" ]; } && export OPT_DEBUG_FILE="$val"
+            export OPT_DEBUG=1
+            emptyOk=1
+        ;;
+        --errors)
+            { [ -n "$val" ] && [ "$val" != "$1" ]; } && export OPT_ERRORS_FILE="$val"
+            export OPT_ERRORS=1
+            emptyOk=1
+        ;;
+        --name)
+            export VPN_SYS_NAME="$val"
+        ;;
+        --tap)
+            export VPN_SYS_TAP_DEV="$val"
+        ;;
+        --br)
+            export VPN_SYS_BR_DEV="$val"
+        ;;
+        --mtu)
+            export VPN_SYS_MTU="$val"
+        ;;
+        *)
+            break
+        ;;
+    esac
+
+    if (($emptyOk == 0)) && { [ -n "$val" = "$1" ] || [ -z "$val" ]; }; then
+        die "Missing value to option:'$opt'"
+    fi
+
+    shift
+done
+
+(($OPT_DEBUG == 1)) \
+    && { [ -n "$OPT_DEBUG_FILE" ] \
+        && {
+            msg set-output type:debug debug:$OPT_DEBUG_FILE
+            msg include-debug
+            msg export-include-debug
+        } || {
+            msg set-output type:debug debug
+            msg include-debug
+            msg export-include-debug
+        }; }
+(($OPT_ERRORS == 1)) \
+    && { [ -n "$OPT_ERRORS_FILE" ] \
+        && {
+            msg set-output type:warn,error file:$OPT_ERRORS_FILE
+            msg include-errors
+            msg export-include-errors
+        } || {
+            msg set-output type:warn,error
+            msg include-errors
+            msg export-include-errors
+        }; }
+{ [ -n "$1" ] && cmd="$1" || { (($OPT_DEBUG == 0)) && die 'No command specified'; }; } && shift;
+case "$cmd" in
+    init)
+        init_folders_and_files
+    ;;
+    reload-nft-rules)
+        reload_all_vpn_nft_rules "$@"
+    ;;
+    vpns-exist-for)
+        vpns_exist_for_required_dev "$@"
+    ;;
+    configure)
+        vpn "$@"
+    ;;
+    reload-nft)
+        check_name_directive
+        reload_vpn_nft_rules $VPN_SYS_NAME
+    ;;
+    *)
+        (($OPT_DEBUG == 0)) && die "Unkown command:'$cmd'"
+    ;;
+esac

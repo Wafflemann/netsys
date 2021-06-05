@@ -1,0 +1,813 @@
+#!/bin/bash
+
+localDir=$(dirname $0)
+
+source $localDir/netsys-base --lib
+
+NO_DEV_CONFIG_FILE_ERROR='Error loading dev:%s. No dev config file at:%s'
+
+# (function)
+init_folders_and_files() {
+    if create_dir $DEV_SYS_RUN_DIR 750; then
+        install_null_file $DEV_SYS_CONFIGURED_DEVS_FILE 640
+        install_null_file $DEV_SYS_DISMANTLED_DEVS_FILE 640
+        install_null_file $DEV_SYS_AVAIL_DEVS_FILE 640
+        install_null_file $DEV_SYS_DOWN_DEVS_FILE 640
+        install_null_file $DEV_SYS_UPSTREAM_CONFIGURED_FILE 640
+        install_null_file $DEV_SYS_UPSTREAM_ROUTED_FILE 640
+    fi
+} # => init_folders_and_files()
+
+# (function args)
+# $1 - devName
+get_log_file_location() {
+    echo "$DEV_SYS_RUN_DIR/${1}_output"
+} # => get_log_file_location()
+
+# (function args)
+# $1 - devName
+set_dev_configured() {
+    echo "$1" >>$DEV_SYS_CONFIGURED_DEVS_FILE
+} # => set_dev_configured()
+
+# (function args)
+# $1 - devName
+set_dev_dismantled() {
+    sed -i -r -e "/$1/d" $DEV_SYS_CONFIGURED_DEVS_FILE
+    echo "$(current_time) $1" >>$DEV_SYS_DISMANTLED_DEVS_FILE
+} # => set_dev_dimantled()
+
+# (function args)
+# $1 - devName
+set_dev_available() {
+    echo "$1" >>$DEV_SYS_AVAIL_DEVS_FILE
+} # => set_dev_available()
+
+# (function args)
+# $1 - devName
+set_dev_unavailable() {
+    sed -i -r -e "/$1/d" $DEV_SYS_AVAIL_DEVS_FILE
+    echo "$(current_time) $1" >>$DEV_SYS_DOWN_DEVS_FILE
+} # => set_dev_unavailable()
+
+# (function args)
+# $1 - upstreamDevName
+set_upstream_configured() {
+    echo "$1" >>$DEV_SYS_UPSTREAM_CONFIGURED_FILE
+} # => set_upstream_configured()
+
+# (function args)
+# $1 - upstreamDevName
+remove_upstream_configured() {
+    sed -i -r -e "/$1/d" $DEV_SYS_UPSTREAM_CONFIGURED_FILE
+} # => remove_upstream_configured()
+
+# (function args)
+# $1 - upstreamDevName
+is_upstream_configured() {
+    file_contains_line $DEV_SYS_UPSTREAM_CONFIGURED_FILE $1
+
+    return $?
+} # => is_upstream_configured()
+
+# (function args)
+# $1 - upstreamDevName
+set_upstream_routed() {
+    echo "$1" >>$DEV_SYS_UPSTREAM_ROUTED_FILE
+} # => set_upstream_routed()
+
+# (function args)
+# $1 - upstreamDevName
+remove_upstream_routed() {
+    sed -i -r -e "/$1/d" $DEV_SYS_UPSTREAM_ROUTED_FILE
+} # => remove_upstream_routed()
+
+# (function args)
+# $1 - upstreamDevName
+is_upstream_routed() {
+    file_contains_line $DEV_SYS_UPSTREAM_ROUTED_FILE $1
+
+    return $?
+} # => is_upstream_routed()
+
+# (function args)
+# $1 - devName
+is_upstream_dev() {
+    file_contains_line $DEV_SYS_UPSTREAM_DEVS_FILE $1
+
+    return $?
+} # => is_upstream_dev()
+
+# (function args)
+# $1 - devName
+has_dev_config() {
+    [ -f "$DEV_SYS_LIB_DIR/d_$1" ] && return 0
+
+    return 1
+} # => has_dev_config()
+
+# (function args)
+# $1 - devName
+source_dev_config() {
+    if has_dev_config "$1"; then
+        DEV_CONFIG_FILE_NAME="$1"
+        source "$DEV_SYS_LIB_DIR/d_$1"
+        return 0
+    fi
+
+    return 1
+} # => source_dev_config()
+
+# (function)
+get_dev_config_names() {
+    escapedLocation="$(escape_slashes "$DEV_SYS_LIB_DIR/d_")"
+
+    find $DEV_SYS_LIB_DIR -type f | sed -r \
+        -e "/$escapedLocation/"'!d' \
+        -e "s/($escapedLocation)(.+)/\2/"
+} # => get_dev_config_names()
+
+# (function args)
+# $1 - cmd
+# $2+ - options
+get_dev_names_for() {
+    { { [ -n "$1" ] && local cmd="$1"; } || die "${FUNCNAME[0]}():No command specified"; } && shift
+
+    local opt='' val=''
+    local opt_devName=''
+    for arg in "$@"
+    do
+        opt=$(get_arg_opt "$arg")
+        val=$(get_arg_val "$arg")
+
+        case "$opt" in
+            dev)
+                opt_devName="$val"
+            ;;
+        esac
+    done
+
+    case "$cmd" in
+        enabled)
+            while read -r devName; do
+                if ! source_dev_config $devName; then
+                    die "$(printf "$NO_DEV_CONFIG_FILE_ERROR" $devName "$DEV_SYS_LIB_DIR/d_$devName")"
+                fi
+
+                [ -v enabled ] && (($enabled == 1)) && echo "$name"
+            done < <(get_dev_config_names)
+        ;;
+        related-upstream)
+            [ -z "$opt_devName" ] && die "${FUNCNAME[0]}(cmd:$cmd): 'dev' option required with command:'$cmd'"
+
+            while read -r devName; do
+                if ! source_dev_config $devName; then
+                    die "$(printf "$NO_DEV_CONFIG_FILE_ERROR" $devName "$DEV_SYS_LIB_DIR/d_$devName")"
+                fi
+
+                [ "$devUpstream" == "$opt_devName" ] && echo "$name"
+            done < <(get_dev_config_names)
+        ;;
+        *)
+            die "${FUNCNAME[0]}(cmd:$cmd): Unrecognized command"
+        ;;
+    esac
+} # => get_dev_names_for()
+
+# (function args)
+# $1 - cmd
+# $2+ - options
+dev_state() {
+    { { [ -n "$1" ] && local cmd="$1"; } || die "${FUNCNAME[0]}(cmd:$cmd): No command specified"; } && shift
+
+    local s=0
+    local opt='' val='' emptyOk=0
+    local opt_devName='' opt_type='' opt_mtu='' opt_mac='' opt_cdir='' opt_brd='' opt_bridge='' opt_upstream=''
+    local opt_inform=0 opt_log=0 opt_logFile='' opt_remove=0 opt_tryConfig=0
+    local opt_withFirewall=0 opt_withRoutes=0 opt_withVPN=0
+    for arg in "$@"
+    do
+        emptyOk=0
+        opt=$(get_arg_opt "$arg")
+        val=$(get_arg_val "$arg")
+
+        case "$opt" in
+            dev)
+                opt_devName="$val"
+            ;;
+            type)
+                opt_type="$val"
+            ;;
+            mtu)
+                opt_mtu="$val"
+            ;;
+            mac)
+                opt_mac="$val"
+            ;;
+            cdir)
+                opt_cdir="$val"
+            ;;
+            brd)
+                opt_brd="$val"
+            ;;
+            bridge)
+                opt_bridge="$val"
+            ;;
+            upstream)
+                opt_upstream="$val"
+            ;;
+            with-firewall)
+                opt_withFirewall=1
+                emptyOk=1
+            ;;
+            with-routes)
+                opt_withRoutes=1
+                emptyOk=1
+            ;;
+            with-vpn)
+                opt_withVPN=1
+                emptyOk=1
+            ;;
+            remove)
+                opt_remove=1
+                emptyOk=1
+            ;;
+            try-config)
+                opt_tryConfig=1
+                emptyOk=1
+            ;;
+            inform)
+                opt_inform=1
+                emptyOk=1
+            ;;
+            log)
+                { [ "$val" = "$arg" ] || [ -z "$val" ]; } \
+                    && opt_log=1 || opt_logFile="$val"
+                emptyOk=1
+            ;;
+            *)
+                die "${FUNCNAME[0]}(cmd:$cmd): Unkown option:'$opt'"
+            ;;
+        esac
+
+        if (($emptyOk == 0)) && { [ "$val" = "$arg" ] || [ -z "$val" ]; }; then
+            die "${FUNCNAME[0]}(cmd:$cmd): Missing value to option:$opt"
+        fi
+    done
+
+    case "$cmd" in
+        setup|dismantle|up|down)
+            [ -z "$opt_devName" ] && die "${FUNCNAME[0]}(cmd:$cmd): option:'dev' required for command:'$cmd'"
+
+            local configExists=0
+            source_dev_config $opt_devName && configExists=1 || local enabled=1 name="$opt_devName"
+
+            (($enabled != 1)) && return 2
+
+            { [ -n "$opt_logFile" ] && local logFile="$opt_logFile" \
+                || { (($opt_log == 1)) && local logFile="$(get_log_file_location $name)"; }
+            } && {
+                msg set-output file:$logFile permissions:$GBL_LOG_FILE_PERMISSIONS
+                msg enable-timestamp
+            }
+
+	    { local type=$(get_either $devType $opt_type) c=$? && (($c == 0)); } \
+                || die "${FUNCNAME[0]}(cmd:$cmd): option:'type' required for command:'$cmd'"
+            { local mtu=$(get_either $devMTU $opt_mtu) c=$? && (($c == 0)); } \
+                || local mtu='1500'
+
+            (($configExists == 1)) && local msgInfo="[$DEV_CONFIG_FILE_NAME]" || local msgInfo="[$name]"
+            case "$type" in
+                l2tap-bridge)
+                    case "$cmd" in
+                        setup|up)
+                            { local bridge=$(get_either $devBridge $opt_bridge) c=$? && (($c == 0)); } \
+                                || die "${FUNCNAME[0]}(cmd:$cmd): option:'bridge' needed for $type interface"
+                        ;;
+                    esac
+                ;;
+                macvlan)
+                    case "$cmd" in
+                        setup|up)
+                            { local upstream=$(get_either $devUpstream $opt_upstream) c=$? && (($c == 0)); } \
+                                || die "${FUNCNAME[0]}(cmd:$cmd): option:'upstream' needed for $type interface"
+                        ;;&
+                        setup)
+                            { local mac=$(get_either $devMAC $opt_mac) c=$? && (($c == 0)); } \
+                                || die "${FUNCNAME[0]}(cmd:$cmd): option:'mac' needed for $type interface"
+                            { local ipCDIR=$(get_either $devCDIR $opt_cdir) c=$? && (($c == 0)); } \
+                                || die "${FUNCNAME[0]}(cmd:$cmd): option:'cdir' needed for $type interface"
+                            { local ipBroadcast=$(get_either $devBroadcast $opt_brd) c=$? && (($c == 0)); } \
+                                || local ipBroadcast=$(get_broadcast_IP $ipCDIR)
+                        ;;
+                    esac
+                ;;
+            esac
+        ;;&
+        setup)
+            if ! is_dev_configured $name; then
+                if ! (
+                    case "$type" in
+                        l2tap-bridge)
+                            info "$msgInfo Setting up $type dev:$name to bridge:$bridge with MTU:$mtu"
+                            ip link set dev $name mtu $mtu master $bridge promisc on 2>&14 \
+                                || {
+                                    error "(cmd:$cmd|type:$type): Failed setting dev:$name to bridge:$bridge"
+                                    exit 1
+                                }
+                        ;;
+                        macvlan)
+                            info "$msgInfo Setting up $type dev:$name MAC:$mac"
+                            ip link add $name link $upstream type $type 2>&14 \
+                                || {
+                                    error "(cmd:$cmd|type:$type): Failed adding dev:$name to upstream:$upstream"
+                                }
+                            ip link set dev $name mtu $mtu address $mac 2>&14 \
+                                || {
+                                    error "(cmd:$cmd|type:$type): Failed setting dev:$name mac address to:$mac"
+                                    exit 1
+                                }
+                            ip address add $ipCDIR broadcast $ipBroadcast dev $name 2>&14 \
+                                || {
+                                    error "(cmd:$cmd|type:$type): Failed adding IP:$ipCDIR for dev:$name"
+                                    exit 1
+                                }
+                        ;;
+                    esac
+                ); then
+                    s=1
+                    error "${FUNANAME[0]}(cmd:$cmd): Failed to setup dev:$name"
+                else
+                    info "$msgInfo STATUS--> dev:$name type:$type is CONFIGURED"
+                    set_dev_configured $name
+                fi
+            else
+                s=2
+                warn "Cannot setup, dev:$name is already configured"
+            fi
+        ;;&
+        dismantle)
+            if is_dev_configured $name; then
+                if ! (
+                    info "$msgInfo Dismantling $type dev:$name"
+
+                    case "$type" in
+                        l2tap-bridge)
+                            ip link set dev $name nomaster promisc off 2>&14 \
+                                || {
+                                    error "(cmd:$cmd|type:$type): Failed removing dev:$name from bridge:$bridge"
+                                    exit 1
+                                }
+                        ;;
+                    esac
+
+                    if (($opt_remove == 1)); then
+                        info "$msgInfo Removing $type dev:$name"
+
+                        case "$type" in
+                            l2tap-bridge|macvlan)
+                                ip link delete $name type $type 2>&14 \
+                                    || {
+                                        error "(cmd:$cmd|type:$type): Failed deleting dev:$name"
+                                        exit 1
+                                    }
+                            ;;
+                        esac
+                    fi
+                ); then
+                    s=1
+                    error "${FUNCNAME[0]}(cmd:$cmd): Failed to dismantle dev:$name"
+                else
+                    info "$msgInfo STATUS--> dev:$name type:$type is DISMANTLED"
+                    set_dev_dismantled $name
+                fi
+            else
+                s=2
+                warn "Cannot dismantle, dev:$name isn't configured"
+            fi
+        ;;&
+        up)
+            if is_dev_configured $name \
+                && { [ -n "$upstream" ] && is_dev_available $upstream; } \
+                || { [ -n "$bridge" ] && is_dev_available $bridge; };
+            then
+                if ! (
+                    (($opt_withFirewall == 1)) \
+                        && { $FIREWALL_SYS_SCRIPT --dev-name=$opt_devName has-firewall-config \
+                            && {
+                                info "$msgInfo Configuring firewall rules for dev:$name"
+                                $FIREWALL_SYS_SCRIPT --log-file=$logFile --dev-name=$name insert-rules \
+                                    || { s=1; error "Failed configuring firewall for dev:$name"; }
+                            } || { [ -p /dev/stdin ] \
+                                && $FIREWALL_SYS_SCRIPT --log-file=$logFile --dev-name=$name \
+                                        modify-runtime insert </dev/stdin \
+                                || { s=1; error "Failed configuring firewall for dev:$name"; }; } \
+                            || { s=2; warn "No firewall to configure for dev:$name"; }; }
+
+                    info "$msgInfo Bringing up $type dev:$name"
+
+                    case "$type" in
+                        l2tap-bridge|macvlan)
+                            ip link set up $name 2>&14
+                        ;;
+                    esac
+
+                    info "$msgInfo STATUS--> dev:$name type:$type is UP"
+                    set_dev_available $name
+
+                    (($opt_withRoutes == 1)) \
+                        && { {
+                            msg export-all
+                            debug "$msgInfo Wait Ready For:$($RULESETS_SYS_SCRIPT wait-ready-for-dev $opt_devName)"
+                        } && {
+                            info "$msgInfo Configuring routes for dev:$name"
+                            $RULESETS_SYS_SCRIPT up-all for-related dev:$name \
+                                || { s=1; error "Failed configuring routes for dev:$name"; }
+                        } || { s=1; error "Failed configuring routes for dev:$name, timed out"; }; }
+
+                    (($opt_withVPN == 1)) \
+                        && { $VPN_SYS_SCRIPT vpns-exist-for $name \
+                            && {
+                                info "$msgInfo Bringing up VPNs for dev:$name"
+                                while read -r vpnName; do
+                                    info "$msgInfo VPN:$vpnName is UP"
+                                done < <(
+                                    $VPN_SYS_SCRIPT configure setup-all-for dev:$name log:$logFile \
+                                        || { s=1; error "Failed configuring VPNs for dev:$name"; }
+                                )
+                            } || { s=2; warn "No VPNs exist for dev:$name"; }; }
+
+                    (($s != 1))
+                ); then
+                    s=1
+                    error "${FUNCNAME[0]}(cmd:$cmd): Failure while bringing up dev:$name"
+                fi
+            else
+                s=2
+                warn "Cannot bring up, dev:$name has unavailable required devs"
+            fi
+        ;;&
+        down)
+            if is_dev_available $name; then
+                if ! (
+                    (($opt_withVPN == 1)) \
+                        && { $VPN_SYS_SCRIPT vpns-exist-for $name \
+                            && {
+                                info "$msgInfo Bringing down VPNs for dev:$name"
+                                while read -r vpnName; do
+                                    info "$msgInfo VPN:$vpnName is DOWN"
+                                done < <(
+                                    $VPN_SYS_SCRIPT configure teardown-all-for dev:$name log:$logFile \
+                                        || { s=1; error "Failed tearing down VPNs for dev:$name"; }
+                                )
+                            } || { s=2; warn "No VPNs exist for dev:$name"; }; }
+
+                    (($opt_withRoutes == 1)) \
+                        && {
+                            info "$msgInfo Bringing down routes for dev:$name"
+                            msg export-all
+                            $RULESETS_SYS_SCRIPT down-all for-related dev:$name \
+                                || { s=1; error "Failed dismantling routes for dev:$name"; }
+                        }
+
+                    info "$msgInfo Bringing down $type dev:$name"
+
+                    case "$type" in
+                        l2tap-bridge|macvlan)
+                            ip link set down $name 2>&14
+                        ;;
+                    esac
+
+                    info "$msgInfo STATUS--> dev:$name type:$type is DOWN"
+                    set_dev_unavailable $name
+
+                    (($opt_withFirewall == 1)) \
+                        && { $FIREWALL_SYS_SCRIPT --dev-name=$opt_devName has-firewall-config \
+                            && {
+                                info "$msgInfo Removing firewall rules for dev:$name"
+                                $FIREWALL_SYS_SCRIPT --log-file=$logFile --dev-name=$name remove-rules \
+                                    || { s=1; error "Failed removing firewall for dev:$name"; }
+                            } || { [ -p /dev/stdin ] \
+                                && $FIREWALL_SYS_SCRIPT --log-file=$logFile --dev-name=$name \
+                                        modify-runtime remove </dev/stdin \
+                                || { s=1; error "Failed removing firewall for dev:$name"; }; } \
+                            || { s=2; warn "No firewall to remove for dev:$name"; }; }
+
+                    (($s != 1))
+                ); then
+                    s=1; error "${FUNCNAME[0]}(cmd:$cmd): Failure while bringing down dev:$name"
+                fi
+            else
+                s=2; warn "Cannot bring down, dev:$name isn't available"
+            fi
+        ;;&
+        setup|dismantle|up|down)
+            debug "${FUNCNAME[0]}(cmd:$cmd|dev:$name): status:$s"
+            [ -n "$logFile" ] && msg reset-all
+            return $s
+        ;;
+        up-all|down-all)
+            local devStateArgs=$(sed -r \
+                -e 's/(.+)*(dev:\w+)\s*(.+)*/\1\3/' <<<"$@")
+        ;;&
+        up-all-for|down-all-for)
+            [ -z "$opt_devName" ] && die "${FUNCNAME[0]}(cmd:$cmd): option:'dev' required for command:'$cmd'"
+            local devStateArgs=$(sed -r \
+                -e 's/(.+)*(dev:\w+)\s*(.+)*/\1\3/;s/(.+)*(with-routes)\s*(.+)*/\1\3/' <<<"$@")
+        ;;&
+        up-all-for)
+            if ! is_dev_available $opt_devName; then
+                die "${FUNCNAME[0]}(cmd:$cmd): upstreamDev:$opt_devName is not available"
+            fi
+        ;;&
+        down-all-for)
+            if ! is_upstream_configured $opt_devName; then
+                die "${FUNCNAME[0]}(cmd:$cmd): upstreamDev:$opt_devName is not configured"
+            fi
+        ;;&
+        up-all|down-all|up-all-for|down-all-for)
+            local cmdScope=${cmd##*-}
+            local relatedNamesFile=$(create_tmp_file)
+            case "$cmdScope" in
+                all)
+                    get_dev_names_for enabled >$relatedNamesFile
+                ;;
+                for)
+                    if ! is_upstream_dev $opt_devName; then
+                        die "${FUNCNAME[0]}(cmd:$cmd): For cmd, upstreamDev is required for 'dev' option"
+                    fi
+
+                    get_dev_names_for related-upstream dev:$opt_devName >$relatedNamesFile
+                ;;
+            esac
+
+            { (($opt_log == 1)) \
+                && { case "$cmdScope" in
+                        all) die "${FUNCNAME[0]}(cmd:$cmd): No where to write the log output to";;
+                        for) local logFile="$(get_log_file_location $opt_devName)";;
+                    esac; } \
+                || { [ -n "$opt_logFile" ] && local logFile="$opt_logFile"; } \
+            } && {
+                msg set-output file:$logFile permissions:$GBL_LOG_FILE_PERMISSIONS
+                msg enable-timestamp
+            }
+        ;;&
+        up-all-for)
+            (($opt_withFirewall == 1)) \
+                && { $FIREWALL_SYS_SCRIPT --dev-name=$opt_devName has-firewall-config \
+                    && { $FIREWALL_SYS_SCRIPT --log-file=$logFile --dev-name=$opt_devName insert-rules \
+                        || { s=1; error "Failed configuring firewall for upstreamDev:$opt_devName"; }; } \
+                    || { s=2; warn "No firewall to configure for upstreamDev:$opt_devName"; }; }
+        ;;&
+        down-all-for)
+            (($opt_withRoutes == 1)) \
+                && {
+                    msg export-all
+                    $RULESETS_SYS_SCRIPT down-all for-related dev:$opt_devName \
+                        && remove_upstream_routed $opt_devName \
+                        || { s=1; error "Failed dismantling routes for devs using upstreamDev:$opt_devName"; }
+                }
+        ;;&
+        up-all|down-all|up-all-for|down-all-for)
+            local cmdType=${cmd%%-*}
+
+            if ! (
+                s=0
+	        exec 20<$relatedNamesFile
+                while read -u 20 -r devName; do
+                    case "$cmdType" in
+                        up)
+                            info "Attempting to configure and bring up dev:$devName"
+                            dev_state setup log dev:$devName $devStateArgs \
+                                && { dev_state $cmdType log dev:$devName $devStateArgs \
+                                    || { s=$?; error "Failed to bring up dev:$devName"; }; } \
+                                || { s=$?; error "Failed to configure dev:$devName"; }
+                        ;;
+                        down)
+                            if (($opt_inform == 0)) || [ "$opt_devName" != "$upstream" ]; then
+                                info "Attempting to bring down and dismantle dev:$devName"
+                                dev_state $cmdType log dev:$devName $devStateArgs \
+                                    || { s=$?; error "Failed to bring down dev:$devName"; }
+                                dev_state dismantle log dev:$devName $devStateArgs \
+                                    || { s=$?; error "Failed to dismantle dev:$devName"; }
+                            fi
+                        ;;
+                    esac
+                done
+	        exec 20>&-
+
+                (($s != 1))
+            ); then
+                s=1; error "${FUNCNAME[0]}(cmd:$cmd): One or more devs failed to be configured and/or brought up under upstreamDev:$opt_devName"
+            fi
+        ;;&
+        up-all-for)
+            (($opt_withRoutes == 1)) \
+                && { {
+                    msg export-all
+                    debug "Wait Ready For:$($RULESETS_SYS_SCRIPT wait-ready-for-dev $opt_devName 0)"
+                } && {
+                    $RULESETS_SYS_SCRIPT up-all for-related dev:$opt_devName \
+                        && set_upstream_routed $opt_devName \
+                        || { s=1; error "Failed configuring routes for devs using upstreamDev:$opt_devName"; }
+                } || { s=2; warn "Not ready to configure routes for devs using upstreamDev:$opt_devName"; }; }
+
+            set_upstream_configured $opt_devName
+        ;;
+        down-all-for)
+            (($opt_withFirewall == 1)) \
+                && { $FIREWALL_SYS_SCRIPT --dev-name=$opt_devName has-firewall-config \
+                    && { $FIREWALL_SYS_SCRIPT --log-file=$logFile --dev-name=$opt_devName remove-rules \
+                        || { s=1; error "Failed dismantling firewall for upstreamDev:$opt_devName"; }; } \
+                    || { s=2; warn "No firewall to dismantle for upstreamDev:$opt_devName"; }; }
+
+            remove_upstream_configured $opt_devName
+        ;;
+        up-all|down-all|up-all-for|down-all-for)
+            debug "${FUNCNAME[0]}(cmd:$cmd|dev:$opt_devName): status:$s"
+            [ -n "$logFile" ] && msg reset-all
+            return $s
+        ;;
+        *)
+            die "${FUNCNAME[0]}(cmd:$cmd): Unrecognized command"
+        ;;
+    esac
+} # => dev_state()
+
+# (function)
+poll_upstream_devs_for_available_routing() {
+    while read -r upstreamDev; do
+        debug "Checking if devs for upstream:$upstreamDev are available for routing"
+
+        if { is_upstream_configured $upstreamDev \
+            && ! is_upstream_routed $upstreamDev \
+            || { is_dev_available $upstreamDev \
+                && { ! is_dev_up $upstreamDev && set_dev_available $upstreamDev; } \
+                && dev_state up-all-for dev:$upstreamDev log inform with-vpn with-firewall; } \
+            } && debug "Wait Ready For:$($RULESETS_SYS_SCRIPT wait-ready-for-dev $upstreamDev 0)";
+        then
+            msg set-output file:"$(get_log_file_location $upstreamDev)" permissions:$GBL_LOG_FILE_PERMISSIONS
+            msg export-all
+
+            $RULESETS_SYS_SCRIPT up-all for-related dev:$upstreamDev \
+                || error "Failed configuring routes for devs related to upstream:$upstreamDev"
+            set_upstream_routed $upstreamDev
+        fi
+    done <$DEV_SYS_UPSTREAM_DEVS_FILE
+} # => poll_upstream_devs_for_available_routing()
+
+# (function args)
+# $1 - state
+# $2+ - options
+inform_state() {
+    { { [ -n "$1" ] && local state="$1"; } || die "${FUNCNAME[0]}(state:$state): No system state supplied"; } && shift
+
+    local opt='' val='' emptyOk=0
+    local opt_devName='' opt_tryConfig=0
+    for arg in "$@"
+    do
+        emptyOk=0
+        opt=$(get_arg_opt "$arg")
+        val=$(get_arg_val "$arg")
+
+        case "$opt" in
+            dev)
+                opt_devName="$val"
+            ;;
+            try-config)
+                opt_tryConfig=1
+                emptyOk=1
+            ;;
+        esac
+
+        if (($emptyOk == 0)) && { [ "$val" = "$arg" ] || [ -z "$val" ]; }; then
+            die "${FUNCNAME[0]}(state:$state): Missing value to option:'$opt'"
+        fi
+    done
+
+    case "$state" in
+        carrier-gained|routable|carrier-lost)
+            [ -z "$opt_devName" ] && die "${FUNCNAME[0]}(state:$state): option:'dev' required"
+
+            grep -Eq "($(cat $GBL_SYS_IGNORE_DEVS_FILE))" <<<$opt_devName && return 2
+
+            info "Informed dev:$opt_devName has system state of:'$state'"
+        ;;&
+        carrier-gained)
+#            if $FIREWALL_SYS_SCRIPT --dev-name=$opt_devName has-firewall-config; then
+#                info "Configuring firewall rules for dev: $opt_devName"
+
+#                $FIREWALL_SYS_SCRIPT --log-file=$devLogFile --dev-name=$opt_devName insert-rules
+#            fi
+        ;;
+        routable)
+            if (($opt_tryConfig == 1)); then
+                is_upstream_dev $opt_devName \
+                    && { ! is_dev_available $opt_devName \
+                        && {
+                            set_dev_available $opt_devName
+                            dev_state up-all-for dev:$opt_devName log inform with-routes with-vpn with-firewall
+                        }; } \
+                    || { ! has_dev_config $opt_devName \
+                        && { ! is_dev_available $opt_devName && set_dev_available $opt_devName; }; }
+
+                poll_upstream_devs_for_available_routing
+            fi
+        ;;
+        carrier-lost)
+            if (($opt_tryConfig == 1)); then
+                if is_upstream_dev $opt_devName; then
+                    dev_state down-all-for dev:$opt_devName log inform remove with-routes with-vpn with-firewall
+                fi
+            fi
+
+	    set_dev_unavailable $opt_devName
+        ;;
+    esac
+} # => inform_state()
+
+[ -v OPT_DEBUG ] || OPT_DEBUG=0
+[ -v OPT_DEBUG_FILE ] || OPT_DEBUG_FILE=''
+
+[ -v OPT_ERRORS ] || OPT_ERRORS=0
+[ -v OPT_ERRORS_FILE ] || OPT_ERRORS_FILE=''
+
+while :; do
+    emtpyOk=0
+    opt=$(get_arg_opt "$1")
+    val=$(get_arg_val "$1")
+
+    case "$opt" in
+        --debug)
+            { [ -n "$val" ] && [ "$val" != "$1" ]; } && export OPT_DEBUG_FILE="$val"
+            export OPT_DEBUG=1
+            emptyOk=1
+        ;;
+        --errors)
+            { [ -n "$val" ] && [ "$val" != "$1" ]; } && export OPT_ERRORS_FILE="$val"
+            export OPT_ERRORS=1
+            emptyOk=1
+        ;;
+        *)
+            break
+        ;;
+    esac
+
+    if (($emptyOk == 0)) && { [ -n "$val" = "$1" ] || [ -z "$val" ]; }; then
+        die "Missing value to option:'$opt'"
+    fi
+
+    shift
+done
+
+(($OPT_DEBUG == 1)) \
+    && { [ -n "$OPT_DEBUG_FILE" ] \
+        && {
+            msg set-output type:debug debug:$OPT_DEBUG_FILE
+            msg include-debug
+            msg export-include-debug
+        } || {
+            msg set-output type:debug debug
+            msg include-debug
+            msg export-include-debug
+        }; }
+(($OPT_ERRORS == 1)) \
+    && { [ -n "$OPT_ERRORS_FILE" ] \
+        && {
+            msg set-output type:warn,error file:$OPT_ERRORS_FILE
+            msg include-errors
+            msg export-include-errors
+        } || {
+            msg set-output type:warn,error
+            msg include-errors
+            msg export-include-errors
+        }; }
+{ [ -n "$1" ] && cmd="$1" || { (($OPT_DEBUG == 0)) && die 'No command specified'; }; } && shift;
+case "$cmd" in
+    init)
+        init_folders_and_files
+    ;;
+    inform-state)
+        inform_state "$@"
+    ;;
+    setup)
+    ;&
+    dismantle)
+    ;&
+    up)
+    ;&
+    down)
+    ;&
+    up-all)
+    ;&
+    down-all)
+    ;&
+    up-all-for)
+    ;&
+    down-all-for)
+        dev_state $cmd "$@"
+    ;;
+    *)
+        (($OPT_DEBUG == 0)) && die "Unkown command:'$cmd'"
+    ;;
+esac

@@ -1,0 +1,879 @@
+#!/bin/bash
+
+localDir=$(dirname $0)
+
+source $localDir/netsys-base --lib
+
+NO_COMMAND_ERROR='%s(): No command specified'
+UNKNOWN_COMMAND_ERROR="%s(): Unknown command:'%s'"
+UNKNOWN_OPTION_ERROR="Unknown option:'%s'"
+MISSING_OPTION_VALUE_ERROR="Missing value to option:'%s'"
+OPTION_NOT_SPECIFIED_ERROR="option '%s' not specified"
+
+NO_RULESET_FILE_ERROR='Error loading table ruleset:%s. No table config file at:%s'
+
+REQUIRED_CODE_AWK_UPSTREAMDEV="{a=0}/1/{a=1}a"
+REQUIRED_CODE_AWK_DEFAULTGW_DEVROUTE="{a=0}/23/{a=1}a"
+REQUIRED_CODE_AWK_DEFAULTGW="{a=0}/2/{a=1}a"
+REQUIRED_CODE_AWK_DEVROUTE="{a=0}/3/{a=1}a"
+
+# (function)
+init_folders_and_files() {
+    if create_dir $RULESETS_SYS_RUN_DIR 750; then
+        install_null_file $RULESETS_SYS_LOADED_RULESETS_FILE 640
+    fi
+} # => init_folders_and_files()
+
+# (function args)
+# $1 - rulesetName
+get_log_file_location() {
+    echo "$RULESETS_SYS_RUN_DIR/${1}_output"
+} # => get_log_file_location()
+
+# (function args)
+# $1 - rulesetName
+set_ruleset_loaded() {
+    echo "$1" >>$RULESETS_SYS_LOADED_RULESETS_FILE
+} # => set_ruleset_loaded()
+
+# (function args)
+# $1 - rulesetName
+set_ruleset_unloaded() {
+    sed -i -r -e "/$1/ d" $RULESETS_SYS_LOADED_RULESETS_FILE
+} # => set_rules_unloaded()
+
+# (function args)
+# $1 - devName
+get_dev_required_code() {
+    match=0
+
+    if [ "$1" == "$upstreamDev" ]; then
+        match=1
+        printf 1
+    fi
+
+    if [ "$initDefaultGW" == "1" ] && [ "$1" == "$gwDev" ]; then
+        match=1
+        printf 2
+    fi
+
+    for dev in ${devRoutes[*]}
+    do
+        if [ "$1" == "$dev" ]; then
+            match=1
+            printf 3
+            break
+        fi
+    done
+
+    if [ $match -eq 0 ]; then
+        printf 0
+    fi
+} # get_dev_required_code()
+
+# (function args)
+# $1 - rulesetName
+has_ruleset_config() {
+    local rulesetFileLocation="$RULESETS_SYS_CONF_DIR/t_$1"
+    if [ -f "$rulesetFileLocation" ]; then
+        echo "$rulesetFileLocation"
+        return 0
+    fi
+
+    return 1
+} # => has_ruleset_config()
+
+# (function args)
+# $1 - rulesetName
+source_ruleset_config() {
+    unset tableName upstreamDev enabled
+    unset fromIP fromDev
+    unset initDefaultGW removeFromDefaultTable
+    unset gwDev gwIP
+    unset devRoutes
+
+    pdebug "[ruleset:%s] Attempting to load configuration file" $1
+    if RULESET_FILE_LOCATION=$(has_ruleset_config "$1"); then
+        RULESET_NAME=$1
+        source $RULESET_FILE_LOCATION
+        return 0
+    fi
+
+    perror "[ruleset:%s] No configuration file found for ruleset" $1
+    return 1
+} # => source_ruleset_config()
+
+# (function)
+get_ruleset_names() {
+    escapedLocation="$(escape_slashes "$RULESETS_SYS_CONF_DIR/t_")"
+
+    find $RULESETS_SYS_CONF_DIR -type f | sed -r \
+        -e "/$escapedLocation/"'!d' \
+        -e "s/($escapedLocation)(.+)/\2/"
+} # => get_ruleset_names()
+
+# (function args)
+# $1 - cmd
+# $2+ - options
+get_ruleset_names_for() {
+    local cmd=''
+    local opt='' val=''
+    local opt_devName=''
+    for arg in "$@"
+    do
+        opt=$(get_arg_opt "$arg")
+        val=$(get_arg_val "$arg")
+
+        case "$opt" in
+            dev)
+                cmd="$opt"
+                opt_devName="$val"
+            ;;
+        esac
+    done
+
+    [ -z "$cmd" ] && pdie "$NO_COMMAND_ERROR" ${FUNCNAME[0]}
+
+    local devRequiredCode=-1
+    while read -r rulesetName; do
+        if ! source_ruleset_config $rulesetName; then
+            pdie "$NO_RULESET_FILE_ERROR" $rulesetName $RULESET_FILE_LOCATION
+        fi
+
+        case "$cmd" in
+            enabled)
+                (($enabled == 1)) && echo $rulesetName
+            ;;
+            dev)
+                (($enabled == 1)) \
+                    && {
+                        devRequiredCode=$(get_dev_required_code $opt_devName)
+                        (($devRequiredCode > 0)) && echo "$rulesetName|$devRequiredCode"
+                    }
+            ;;
+        esac
+    done < <(get_ruleset_names)
+} # => get_ruleset_names_for()
+
+# (function args)
+# $1+ - options & desiredProperties
+find_properties_in_table() {
+    local cmd_msgError="${FUNCNAME[0]}()"
+
+    local opt='' val='' emptyOk=0
+    local opt_tableName='' opt_re=''
+    declare -a desiredRouteProperties
+    for arg in "$@"
+    do
+        emptyOk=0
+        opt=$(get_arg_opt "$arg")
+        val=$(get_arg_val "$arg")
+
+        case "$opt" in
+            name)
+                opt_tableName="$val"
+            ;;
+            re)
+                opt_re="$val"
+            ;;
+            *)
+                desiredRouteProperties+=("$arg")
+                emptyOk=1
+            ;;
+        esac
+
+        if (($emptyOk == 0)) && { [ "$val" = "$arg" ] || [ -z "$val" ]; }; then
+            pdie "$cmd_msgError: $MISSING_OPTION_VALUE_ERROR" $opt
+        fi
+    done
+
+    [ -z "$opt_tableName" ] && pdie "$cmd_msgError: $OPTION_NOT_SPECIFIED_ERROR" 'name'
+    [ -z "$opt_re" ] && pdie "$cmd_msgError: $OPTION_NOT_SPECIFIED_ERROR" 're'
+
+    local r=1
+
+    find_properties_in_set '|' "${desiredRouteProperties[*]}" < <(
+        local tableInfo=''
+        if tableInfo=$(ip route show table $opt_tableName 2>&14); then
+            sed -r -ne $opt_re 2>&14 <<<$tableInfo
+        fi
+    ); r=$?
+
+    return $r
+} # => find_properties_in_table()
+
+# (function args)
+# $1 - devName
+# $2 - timeToWait (seconds)
+wait_ready_for_dev() {
+    ! { (($2 => 0)) && local waitTime=$2; } >/dev/null 2>&1 \
+        || local waitTime=$RULESETS_SYS_READY_FOR_DEV_WAIT_SECONDS
+
+    local s=0
+    local rulesetNamesFile=$(create_tmp_file)
+    if ! (
+        local rulesetName='' requiredCode=''
+        while read -r rulesetInfo; do
+            rulesetName=${rulesetInfo%|*}
+            requiredCode=${rulesetInfo#*|}
+            echo "$rulesetName"
+
+            debug "[rcde:$requiredCode]ruleset:$rulesetName"
+            is_ruleset_loaded $rulesetName && continue
+            source_ruleset_config $rulesetName
+
+            case "$requiredCode" in
+                $(awk $REQUIRED_CODE_AWK_UPSTREAMDEV <<<$requiredCode))
+                    debug "upstreamDev:$upstreamDev wait:$(wait_till_dev_available $upstreamDev $waitTime)" || exit 1
+                ;;
+                $(awk $REQUIRED_CODE_AWK_DEFAULTGW <<<$requiredCode))
+                    debug "gwDev:$gwDev wait:$(wait_till_dev_available $gwDev $waitTime)" || exit 1
+                ;;
+                $(awk $REQUIRED_CODE_AWK_DEVROUTE <<<$requiredCode))
+                    for devName in ${devRoutes[*]}
+                    do
+                        debug "devName:$devName wait:$(wait_till_dev_available $devName $waitTime)" || exit 1
+                    done
+                ;;
+            esac
+        done < <(get_ruleset_names_for dev:$1)
+    ) >>$rulesetNamesFile; then s=1; fi
+
+    declare -a rulesets
+    while read -r rulesetName; do
+        rulesets+=("$rulesetName")
+    done <$rulesetNamesFile
+
+    [ -z "$3" ] && {
+        (($s == 0)) \
+            && echo "rulesets:${rulesets[*]@Q} for dev:$1 are ready" \
+            || echo "rulesets:${rulesets[*]@Q} for dev:$1 are not ready"; }
+    unset rulesets
+    return $s
+} # => wait_ready_for_dev()
+
+# (function args)
+# $1 - cmd
+# $2+ - options
+table_route() {
+    { { [ -n "$1" ] && local cmd="$1"; } || pdie "$NO_COMMAND_ERROR" ${FUNCNAME[0]}; } && shift
+
+    local cmd_msgError="${FUNCNAME[0]}(cmd:$cmd)"
+
+    local s=0
+    local opt='' val='' emptyOk=0
+    local opt_tableName='' opt_devName='' opt_fromIP='' opt_gwIP='' opt_gwDev=''
+    local opt_quiet=0
+    for arg in "$@"
+    do
+        emptyOk=0
+        opt=$(get_arg_opt "$arg")
+        val=$(get_arg_val "$arg")
+
+        case "$opt" in
+            name)
+                opt_tableName="$val"
+            ;;
+            dev)
+                opt_devName="$val"
+            ;;
+            from-ip)
+                opt_fromIP="$val"
+            ;;
+            gw-ip)
+                opt_gwIP="$val"
+            ;;
+            gw-dev)
+                opt_gwDev="$val"
+            ;;
+            quiet)
+                opt_quiet=1
+                emptyOk=1
+            ;;
+            *)
+                pdie "$cmd_msgError: $UNKOWN_OPTION_ERROR" $opt
+            ;;
+        esac
+
+        if (($emptyOk == 0)) && { [ "$val" = "$arg" ] || [ -z "$val" ]; }; then
+            pdie "$cmd_msgError: $MISSING_OPTION_VALUE_ERROR" $opt
+        fi
+    done
+
+#    parse_args SUP:"$*"  <----------PARSE ARGS--------------
+
+    [ -z "$opt_tableName" ] && pdie "$cmd_msgError: $OPTION_NOT_SPECIFIED_ERROR" 'name'
+
+    local iprouteStatus=255
+    local msgInfo="[ruleset:$RULESET_NAME]"
+    local msgDebug="[ruleset:$RULESET_NAME|table:$opt_tableName]"
+    local msgError="${FUNCNAME[0]}(cmd:$cmd|ruleset:$RULESET_NAME)"
+    if ! { case "$cmd" in
+        add-rule|remove-rule)
+            [ -z "$opt_fromIP" ] && pdie "$cmd_msgError: $OPTION_NOT_SPECIFIED_ERROR" 'from-ip'
+        ;;&
+        add-rule)
+            info "$msgInfo Adding Routing Rule"
+            debug "$msgDebug Routing Rule fromIP:$opt_fromIP status:{$(
+                    ip rule add table $opt_tableName \
+                        from $opt_fromIP 2>&14; print_status)}" \
+                || { s=1; error "$msgError: Failed to add Routing Rule fromIP:$opt_fromIP"; }
+        ;;
+        remove-rule)
+            info "$msgInfo Removing Routing Rule"
+            debug "$msgDebug Routing Rule Removal fromIP:$opt_fromIP status:{$(
+                    ip rule del table $opt_tableName \
+                        from $opt_fromIP 2>&14; print_status)}" \
+                || { s=1; error "$msgError: Failed to remove routing rule fromIP:$opt_fromIP"; }
+        ;;
+        add-dev-route|remove-dev-route|dev-route-exists)
+            [ -z "$opt_devName" ] && pdie "$cmd_msgError: $OPTION_NOT_SPECIFIED_ERROR" 'dev'
+
+	    local devCDIR='' devIP='' netCDIR=''
+            if ! { devCDIR="$(get_dev_CDIR $opt_devName)" && devIP="${devCDIR%/*}"; }; then
+                die "$msgError: Unable to determine the IP address for dev:$opt_devName"
+            elif ! netCDIR="$(get_net_CDIR $devCDIR)"; then
+                die "$msgError: Unable to determine the network CDIR for dev:$opt_devName"
+            fi
+        ;;&
+        add-dev-route)
+            info "$msgInfo Adding Dev Route to:$netCDIR dev:$opt_devName"
+            debug "$msgDebug Dev Route add to:$netCDIR dev:$opt_devName src:$devIP status:{$(
+                    ip route add table $opt_tableName \
+                        $netCDIR dev $opt_devName src $devIP table $opt_tableName 2>&14; print_status)}" \
+                || { s=1; error "$msgError: Failed adding Dev Route to:$netCDIR dev:$opt_devName"; }
+        ;;
+        remove-dev-route)
+            info "$msgInfo Removing Dev Route to:$netCDIR dev:$opt_devName"
+            if ! { case "$(route_contains_src $opt_tableName $netCDIR $opt_devName; echo $?)" in
+                0) debug "$msgDebug Dev Route removal to:$netCDIR dev:$opt_devName src:$devIP status:{$(
+                    ip route del table $opt_tableName \
+                        $netCDIR dev $opt_devName src $devIP 2>&14; print_status)}";;
+                1) debug "$msgDebug Dev Route removal to:$netCDIR dev:$opt_devName status:{$(
+                    ip route del table $opt_tableName \
+                        $netCDIR dev $opt_devName 2>&14; print_status)}";;
+                2) error "$msgError: Undetermined route info CDIR:$netCDIR dev:$opt_devName"; return 2;;
+            esac; }; then
+                s=1; error "$msgError: Failed removing Dev Route to:$netCDIR dev:$opt_devName"
+            fi
+        ;;
+        dev-route-exists)
+            local r=1
+            declare -a desiredRouteProperties=("$netCDIR" "$opt_devName" "$devIP")
+	    find_properties_in_table "${desiredRouteProperties[*]}" name:$opt_tableName \
+                re:"s/($RE_CDIR)\sdev\s(\w+)(\s(.+)*src\s($RE_IP)|.+)*(\smetric.+)*/\1|\2|\5/p"; r=$?
+
+            if (($opt_quiet == 0)); then
+                local msg="$cmd|desiredProps:[${desiredRouteProperties[*]}]"
+                (($r == 0)) && echo "$msg{FOUND}" || echo "$msg{MISSING}"
+            fi
+            return $r
+        ;;
+        add-default-route|remove-default-route|remove-gw-route|default-route-exists|gw-route-exists)
+            [ -z "$opt_gwDev" ] && pdie "$cmd_msgError: $OPTION_NOT_SPECIFIED_ERROR" 'gw-dev'
+
+	    local netCDIR="$(get_net_CDIR_from_dev $opt_gwDev)" \
+                gwDevIP="$(get_dev_IP $opt_gwDev)"
+        ;;&
+        add-default-route|remove-gw-route|default-route-exists|gw-route-exists)
+            [ -z "$opt_gwIP" ] && pdie "$cmd_msgError: $OPTION_NOT_SPECIFIED_ERROR" 'gw-ip'
+        ;;&
+        add-default-route)
+            info "$msgInfo Adding Default Route via:$opt_gwIP dev:$opt_gwDev"
+            debug "$msgDebug Dev Route add to:$netCDIR dev:$opt_gwDev src:$gwDevIP status:{$(
+                    ip route add table $opt_tableName \
+                        $netCDIR dev $opt_gwDev src $gwDevIP 2>&14; print_status)}" \
+                || { s=1; error "$msgError: Failed adding Dev Route to:$netCDIR dev:$opt_gwDev"; }
+            (($s != 1)) \
+                && {
+                    debug "$msgDebug Default Route add via:$opt_gwIP dev:$gwDev src:$gwDevIP status:{$(
+                        ip route add table $opt_tableName \
+                            default via $opt_gwIP dev $opt_gwDev src $gwDevIP 2>&14; print_status)}" \
+                        || { s=1; error "$msgError: Failed adding Default Route via:$opt_gwIP dev:$opt_gwDev"; }
+                } || error "$msgError: Not adding Default Route via:$opt_gwIP dev:$opt_gwDev"
+        ;;
+        remove-default-route)
+            info "$msgInfo Removing Default Route and Dev Route via:$opt_gwIP dev:$opt_gwDev"
+            if ! { case "$(route_contains_src $opt_tableName 'default' $opt_gwDev $opt_gwIP; echo $?)" in
+                0) debug "$msgDebug Default Route removal via:$opt_gwIP dev:$opt_gwDev src:$gwDevIP status:{$(
+                    ip route del table $opt_tableName \
+                        default dev $opt_gwDev src $gwDevIP 2>&14; print_status)}";;
+                1) debug "$msgDebug Default Route removal via:$opt_gwIP dev:$opt_gwDev status:{$(
+                    ip route del table $opt_tableName \
+                        default dev $opt_gwDev 2>&14; print_status)}";;
+                2) error "$msgError: Undetermined route gwDev:$opt_gwDev gwIP:$opt_gwIP"; return 2;;
+            esac; }; then
+                s=1; error "$msgError: Failed removing Default Route via:$opt_gwIP dev:$opt_gwDev"
+            fi
+	    (($s != 1)) \
+                && {
+                    if ! { case "$(route_contains_src $opt_tableName $netCDIR $opt_gwDev; echo $?)" in
+                        0) debug "$msgDebug Dev Route removal to:$netCDIR dev:$opt_gwDev src:$gwDevIP status:{$(
+                            ip route del table $opt_tableName \
+                                $netCDIR dev $opt_gwDev src $gwDevIP 2>&14; print_status)}";;
+                        1) debug "$msgDebug Dev Route removal to:$netCDIR dev:$opt_gwDev status:{$(
+                            ip route del table $opt_tableName \
+                                $netCDIR dev $opt_gwDev 2>&14; print_status)}";;
+                        2) error "$msgError: Undetermined route CDIR:$netCDIR dev:$opt_gwDev"; return 3;;
+                    esac; }; then
+                        s=1; error "$msgError: Failed removing Dev Route to:$netCDIR dev:$opt_gwDev"
+                    fi
+                } || error "$msgError: Not Removing Dev Route dev:$opt_gwDev"
+        ;;
+        remove-gw-route)
+            info "$msgInfo Removing GW Route to:$opt_gwIP dev:$opt_gwDev"
+            if ! { case "$(route_contains_src $opt_tableName $opt_gwIP $opt_gwDev; echo $?)" in
+                0) debug "$msgDebug GW Route removal gw-ip:$opt_gwIP dev:$opt_gwDev src:$gwDevIP status:{$(
+		    ip route del table $opt_tableName \
+                        $opt_gwIP dev $opt_gwDev src $gwDevIP 2>&14; print_status)}";;
+                1) debug "$mgsDebug GW Route removal gw-ip:$opt_gwIP dev:$opt_gwDev src:$gwDevIP status:{$(
+                    ip route del table $opt_tableName \
+                        $opt_gwIP dev $opt_gwDev 2>&14; print_status)}";;
+                2) error "$msgError: Undertermined route ip:$opt_gwIP dev:$opt_gwDev"; return 3;;
+	    esac; }; then
+                s=1; error "$msgError: Failed removing GW Route to:$opt_gwIP dev:$opt_gwDev"
+            fi
+        ;;
+        default-route-exists)
+            local r=1
+            declare -a desiredRouteProperties=("$opt_gwIP" "$opt_gwDev" "$gwDevIP")
+	    find_properties_in_table "${desiredRouteProperties[*]}" name:$opt_tableName \
+                re:"s/default\svia\s($RE_IP)\sdev\s(\w+)(\s(.+)*src\s($RE_IP)|.+)*(\smetric.+)*/\1|\2|\5/p"; r=$?
+
+            if (($opt_quiet == 0)); then
+                local msg="cmd:$cmd|desiredProps:[${desiredRouteProperties[*]}]"
+                (($r == 0)) && echo "$msg{FOUND}" || echo "$msg{MISSING}"
+            fi
+            return $r
+        ;;
+        gw-route-exists)
+            local r=1
+            declare -a desiredRouteProperties=("$opt_gwIP" "$opt_gwDev" "$gwDevIP")
+	    find_properties_in_table "${desiredRouteProperties[*]}" name:$opt_tableName \
+                re:"s/($RE_IP)\sdev\s(\w+)(\s(.+)*src\s($RE_IP)|.+)*(\smetric.+)*/\1|\2|\5/p"; r=$?
+
+            if (($opt_quiet == 0)); then
+                local msg="cmd:$cmd|desiredProps:[${desiredRouteProperties[*]}]"
+                (($r == 0)) && echo "$msg{FOUND}" || echo "$msg{MISSING}"
+            fi
+            return $r
+        ;;
+        flush)
+            info "$msgInfo Flushing table:$opt_tableName"
+            ip route flush table $opt_tableName 2>&14 \
+                || { s=1; error "$msgError: Failed flushing table"; }
+        ;;
+    esac; (($s != 1)); }; then
+        error "$cmd_msgError: Command Failed"
+        return 1
+    fi
+} # => table_route()
+
+# (function args)
+# $1 - cmd
+# $2+ - options
+ruleset() {
+    { { [ -n "$1" ] && local cmd="$1"; } || pdie "$NO_COMMAND_ERROR" ${FUNCNAME[0]}; } && shift
+
+    local cmd_msgError="${FUNCNAME[0]}(cmd:$cmd)"
+
+    local s=0
+    local opt='' val='' emptyOk=0
+    local opt_rulesetName='' opt_devName='' opt_forRelated=0
+    local opt_log=0 opt_logFile=''
+    for arg in "$@"
+    do
+        emptyOk=0
+        opt=$(get_arg_opt "$arg")
+        val=$(get_arg_val "$arg")
+
+        case "$opt" in
+            name)
+                opt_rulesetName="$val"
+            ;;
+            dev)
+                opt_devName="$val"
+            ;;
+            for-related)
+                opt_forRelated=1
+                emptyOk=1
+            ;;
+            log)
+                { [ "$val" = "$arg" ] || [ -z "$val" ]; } \
+                    && opt_log=1 || opt_logFile="$val"
+                emptyOk=1
+            ;;
+            *)
+                pdie "$cmd_msgError: $UNKNOWN_OPTION_ERROR" $opt
+            ;;
+        esac
+
+        if (($emptyOk == 0)) && { [ "$val" = "$arg" ] || [ -z "$val" ]; }; then
+            pdie "$cmd_msgError: $MISSING_OPTION_VALUE_ERROR" $opt
+        fi
+    done
+
+    local msgInfo='[ruleset:%s] %s'
+    local msgDebug='[ruleset:%s|table:%s] %s'
+    local msgError="${FUNCNAME[0]}(cmd:$cmd|ruleset:%s): %s"
+
+    case "$cmd" in
+        up|down)
+            if [ -z "$RULESET_NAME" ]; then
+                [ -z "$opt_rulesetName" ] && pdie "$cmd_msgError: $OPTION_NOT_SPECIFIED_ERROR" 'name'
+                source_ruleset_config $opt_rulesetName
+            fi
+
+            (($enabled != 1)) && return 1
+
+            local systemTable='main'
+        ;;&
+        up)
+            if ! is_ruleset_loaded $RULESET_NAME; then
+                pdebug "$msgDebug" $RULESET_NAME $tableName 'Ruleset not loaded, loading ruleset'
+                if ! (
+                    [ -z "$fromIP" ] && pdie "$msgError" $RULESET_NAME \
+                        "Param:'fromIP' required in config:'$RULESET_FILE_LOCATION'"
+
+                    table_route add-rule name:$tableName from-ip:$fromIP || exit 1
+
+                    if [ -v initDefaultGW ] && (($initDefaultGW == 1)); then
+                        pdebug "$msgDebug" $RULESET_NAME $tableName 'Default GW setup requested'
+                        { [ -n "$gwIP" ] && [ -n "$gwDev" ] \
+                            || pdie "$msgError" $RULESET_NAME \
+                                "Params:'gwIP','gwDev' required in config:'$RULESET_FILE_LOCATION'"
+                        } && {
+                            ! pdebug "$msgDebug" $RULESET_NAME $tableName \
+                                    "Default Route via:$gwIP dev:$gwDev exists:$(
+                                        table_route default-route-exists name:$tableName gw-ip:$gwIP gw-dev:$gwDev
+                                    )" \
+                                && {
+                                    table_route add-default-route name:$tableName gw-ip:$gwIP gw-dev:$gwDev || exit 1
+                                } || pwarn "$msgDebug" $RULESET_NAME $tableName 'WARN: Not adding default route'
+                        }
+                    fi
+
+                    if ((${#devRoutes[@]} > 0)); then
+                        for dev in ${devRoutes[*]}
+                        do
+                            ! pdebug "$msgDebug" $RULESET_NAME $tableName \
+                                    "Dev Route dev:$dev exists:$(
+                                        table_route dev-route-exists name:$tableName dev:$dev
+                                    )" \
+                                && { table_route add-dev-route name:$tableName dev:$dev || exit 1; } \
+                                || pwarn "$msgDebug" $RULESET_NAME $tableName "WARN: Not adding Dev Route dev:$dev"
+                        done
+                    else
+                        pwarn "$msgDebug" $RULESET_NAME $tableName \
+                            "WARN: Param:'devRoutes' not present in config:'$RULESET_FILE_LOCATION'"
+                    fi
+
+                    if [ -v removeFromDefaultTable ] && (($removeFromDefaultTable == 1)); then
+                        pdebug "$msgDebug" $RULESET_NAME $tableName "Removal from '$systemTable' table requested"
+                        if [ -z "$fromDev" ]; then
+                            pdie "$msgError" $RULESET_NAME \
+                                "Param:'fromDev' required in config:'$RULESET_FILE_LOCATION'"
+                        fi
+
+                        local devGWIP=''
+                        if devGWIP="$(get_dev_gw_IP $fromDev $systemTable)" \
+                            && pdebug "$msgDebug" $RULESET_NAME $systemTable \
+                                "Default Route via:$devGWIP dev:$fromDev exists:$(
+                                    table_route default-route-exists name:$systemTable gw-dev:$fromDev gw-ip:$devGWIP
+                                )";
+                        then { case "$(
+                                table_route remove-default-route name:$systemTable gw-dev:$fromDev; echo $?
+                        )" in
+                            1) exit 1;;
+                            2) perror "$msgError" $RULESET_NAME \
+                                "Cannot find Default Route via -> dev:$fromDev";;
+                            3)
+                                pwarn "$msgDebug" $RULESET_NAME $systemTable \
+                                    "WARN: Cannot find Dev Route dev:$fromDev"
+                                if pdebug "$msgDebug" $RULESET_NAME $systemTable \
+                                    "Looking for GW Route via:$devGWIP dev:$fromDev exists:$(
+                                        table_route gw-route-exists name:$systemTable gw-dev:$fromDev gw-ip:$devGWIP
+                                    )";
+                                then
+                                    table_route remove-gw-route name:$systemTable gw-dev:$fromDev gw-ip:$devGWIP
+                                fi
+                            ;;
+                        esac; } elif pdebug "$msgDebug" $RULESET_NAME $systemTable \
+                            "Dev Route dev:$fromDev exists:$(
+                                table_route dev-route-exists name:$systemTable dev:$fromDev
+                            )";
+                        then
+                            { table_route remove-dev-route name:$systemTable dev:$fromDev || exit 1; }
+                        else
+                            pwarn "$msgDebug" $RULESET_NAME $systemTable \
+                                "WARN: dev:$fromDev cannot determine route status"
+                        fi
+                    fi
+
+                    set_ruleset_loaded $RULESET_NAME
+                ); then
+                    s=1; perror "$msgError" $RULESET_NAME "Failed to load ruleset"
+                fi
+            elif (($enabled == 1)); then 
+                s=2; pwarn "$msgDebug" $RULESET_NAME $tableName "WARN: Ruleset already loaded"
+            fi
+
+            return $s
+        ;;
+        down)
+            if is_ruleset_loaded $RULESET_NAME; then
+                pdebug "$msgDebug" $RULESET_NAME $tableName 'Ruleset loaded, unloading ruleset'
+                if ! (
+                    table_route flush name:$tableName 2>&14 || exit 1
+                    table_route remove-rule name:$tableName from-ip:$fromIP 2>&14 || exit 1
+
+                    set_ruleset_unloaded $RULESET_NAME
+                ); then
+                    s=1; perror "$msgError" $RULESET_NAME "Failed to unload ruleset"
+                fi
+            else
+                s=2; pwarn "$msgDebug" $RULESET_NAME $tableName "WARN: Ruleset not configured, cannot unload"
+            fi
+
+            return $s
+        ;;
+        up-all|down-all)
+            declare -a failedRulesetNames
+
+            if ! (
+                local op_type="${cmd%%-*}"
+                local msgInfoBase=${msgInfo%[[:space:]]%s}
+                local msgErrorBase=${msgError%[[:space:]]%s}
+
+                case "$op_type" in
+                    up)
+                        local tableActionMsg="$msgInfoBase Configuring ruleset" \
+                            defaultRouteActionMsg="$msgInfoBase Adding default route via:%s to table:%s" \
+                            devRouteActionMsg="$msgInfoBase Adding route for dev:%s to table:%s"
+
+                        local op_defaultRoute='add-default-route' \
+                            op_devRoute='add-dev-route'
+                    ;;
+                    down)
+                        local tableActionMsg="$msgInfoBase Destroying ruleset" \
+                            defaultRouteActionMsg="$msgInfoBase Removing default route via:%s to table:%s" \
+                            devRouteActionMsg="$msgInfoBase Removing route for dev:%s to table:%s"
+
+                        local op_defaultRoute='remove-default-route' \
+                            op_devRoute='remove-dev-route'
+                    ;;
+                esac
+
+                local failedToRunOperation="$msgErrorBase Failed to run operation:%s for ruleset"
+
+                local rulesetLogFile=''
+                local devIP='' devCDIR='' requiredCode=''
+                local reslt_upstreamDev='' reslt_defaultGW='' reslt_devRoute=''
+                local reslt_routeExists=-1
+                while read -r rulesetName; do
+                    source_ruleset_config $rulesetName
+
+                    (($enabled != 1)) && continue
+
+                    rulesetLogFile="$(get_log_file_location $RULESET_NAME)"
+
+                    if [ -n "$opt_devName" ]; then
+                        devIP="$(get_dev_IP $opt_devName)"
+                        devCDIR="$(get_dev_CDIR $opt_devName)"
+                    fi
+
+                    if (($opt_forRelated == 1)) && [ -z "$opt_devName" ];
+                    then
+                        pdie "$msgError" $RULESET_NAME "option:'with-related' requires option:'dev'"
+                    elif (($opt_forRelated == 1)) \
+                        && { [ "$devIP" == "$fromIP" ] || [ "$devCDIR" == "$fromIP" ]; } \
+                        || (($opt_forRelated == 0));
+                    then
+                        pinfo "$tableActionMsg" $RULESET_NAME
+
+                        msg set-output file:$rulesetLogFile permissions:$GBL_LOG_FILE_PERMISSIONS
+                        msg enable-timestamp
+                        msg export-all
+
+                        ruleset $op_type name:$rulesetName
+                        check_if_perror_and_reset_msg "$failedToRunOperation" $RULESET_NAME $op_type \
+                            || { failedRulesetNames+=($RULESET_NAME); continue; }
+                    elif (($opt_forRelated == 1));
+                    then
+                        requiredCode=$(get_dev_required_code $opt_devName)
+
+                        reslt_upstreamDev="$(awk $REQUIRED_CODE_AWK_UPSTREAMDEV <<<"$requiredCode")"
+                        reslt_defaultGW="$(awk $REQUIRED_CODE_AWK_DEFAULTGW <<<"$requiredCode")"
+                        reslt_devRoute="$(awk $REQUIRED_CODE_AWK_DEVROUTE <<<"$requiredCode")"
+
+                        case $requiredCode in
+                            $reslt_upstreamDev)
+                                pinfo "$tableActionMsg for upstream:%s" $RULESET_NAME $upstreamDev
+                            ;;&
+                            $reslt_defaultGW)
+                                pinfo "$defaultRouteActionMsg" $RULESET_NAME $gwIP $tableName
+                            ;;&
+                            $reslt_devRoute)
+                                pinfo "$devRouteActionMsg" $RULESET_NAME $opt_devName $tableName
+                            ;;&
+                            $requiredCode)
+                                msg set-output file:$rulesetLogFile permissions:$GBL_LOG_FILE_PERMISSIONS
+                                msg enable-timestamp
+                                msg export-all
+                            ;;&
+                            $reslt_upstreamDev)
+                                ruleset $op_type name:$rulesetName
+                                check_if_perror_and_reset_msg "$failedToRunOperation" $RULESET_NAME $op_type \
+                                    || { failedRulesetNames+=($RULESET_NAME); continue; }
+                            ;;
+                            $reslt_defaultGW)
+                                pdebug "$msgDebug" $RULESET_NAME $tableName \
+                                    "Default Route via:$gwIP dev:$gwDev exists:$(
+                                        table_route default-route-exists name:$tableName gw-ip:$gwIP gw-dev:$gwDev
+                                    )"
+                                reslt_routeExists=$?
+
+                                case "$op_defaultRoute" in
+                                    add-default-route)
+                                        (($reslt_routeExists == 0)) \
+                                            && {
+                                                pdebug "$msgDebug" $RULESET_NAME $tableName \
+                                                    "Not adding Default Route via:$gwIP dev:$gwDev"
+                                                continue
+                                            }
+                                    ;;
+                                    remove-default-route)
+                                        (($reslt_routeExists == 1)) \
+                                            && {
+                                                pdebug "$msgDebug" $RULESET_NAME $tableName \
+                                                    "Not removing Default Route via:$gwIP dev:$gwDev"
+                                                continue
+                                            }
+                                    ;;
+                                esac
+
+                                table_route $op_defaultRoute name:$tableName gw-ip:$gwIP gw-dev:$gwDev 2>&14
+                                check_if_perror_and_reset_msg "$failedToRunOperation" $RULESET_NAME $op_defaultRoute \
+                                    || { failedRulesetNames+=($RULESET_NAME); continue; }
+                            ;;
+                            $reslt_devRoute)
+                                pdebug "$msgDebug" $RULESET_NAME $tableName \
+                                    "Dev Route dev:$opt_devName exists:$(
+                                        table_route dev-route-exists name:$tableName dev:$opt_devName
+                                    )"
+                                reslt_routeExists=$?
+
+                                case "$op_devRoute" in
+                                    add-dev-route)
+                                        (($reslt_routeExists == 0)) \
+                                            && {
+                                                pdebug "$msgDebug" $RULESET_NAME $tableName \
+                                                    "Not adding Dev Route dev:$opt_devName"
+                                                continue
+                                            }
+                                    ;;
+                                    remove-dev-route)
+                                        (($reslt_routeExists == 1)) \
+                                            && {
+                                                pdebug "$msgDebug" $RULESET_NAME $tableName \
+                                                    "Not removing Dev Route dev:$opt_devName"
+                                                continue
+                                            }
+                                    ;;
+                                esac
+
+                                table_route $op_devRoute name:$tableName dev:$opt_devName 2>&14
+                                check_if_perror_and_reset_msg "$failedToRunOperation" $RULESET_NAME $op_devRoute \
+                                    || { failedRulesetNames+=($RULESET_NAME); continue; }
+                            ;;
+                        esac
+                    fi
+                done < <(get_ruleset_names)
+
+                ((${#failedRulesetNames[@]} > 0)) && exit 1
+            ); then
+                s=1; error "$cmd_msgError: Failed to load rulesets:[${failedRulesetNames[*]}]"
+            fi
+
+            return $s
+        ;;
+    esac
+
+    return 1
+} # => ruleset()
+
+[ -v OPT_DEBUG ] || OPT_DEBUG=0
+[ -v OPT_DEBUG_FILE ] || OPT_DEBUG_FILE=''
+
+[ -v OPT_ERRORS ] || OPT_ERRORS=0
+[ -v OPT_ERRORS_FILE ] || OPT_ERRORS_FILE=''
+
+while :; do
+    emptyOk=0
+    opt=$(get_arg_opt "$1")
+    val=$(get_arg_val "$1")
+
+    case "$opt" in
+        --debug)
+            { [ -n "$val" ] && [ "$val" != "$1" ]; } && export OPT_DEBUG_FILE="$val"
+            export OPT_DEBUG=1
+            emptyOk=1
+        ;;
+        --errors)
+            { [ -n "$val" ] && [ "$val" != "$1" ]; } && export OPT_ERRORS_FILE="$val"
+            export OPT_ERRORS=1
+            emptyOk=1
+        ;;
+        *)
+            break
+        ;;
+    esac
+
+    if (($emptyOk == 0)) && { [ "$val" = "$1" ] || [ -z "$val" ]; }; then
+        pdie "$MISSING_OPTION_VALUE_ERROR" $opt
+    fi
+
+    shift
+done
+
+(($OPT_DEBUG == 1)) \
+    && { [ -n "$OPT_DEBUG_FILE" ] \
+        && {
+            msg set-output type:debug debug:$OPT_DEBUG_FILE
+            msg include-debug
+            msg export-include-debug
+        } || {
+            msg set-output type:debug debug
+            msg include-debug
+            msg export-include-debug
+        }; }
+(($OPT_ERRORS == 1)) \
+    && { [ -n "$OPT_ERRORS_FILE" ] \
+        && {
+            msg set-output type:warn,error file:$OPT_ERRORS_FILE
+            msg include-errors
+            msg export-include-errors
+        } || {
+            msg set-output type:warn,error
+            msg include-errors
+            msg export-include-errors
+        }; }
+{ [ -n "$1" ] \
+    && cmd="$1" \
+    || { (($OPT_DEBUG == 0)) && pdie "$NO_COMMAND_ERROR" $(get_current_file_name); }
+} && shift;
+
+case "$cmd" in
+    init)
+        init_folders_and_files
+    ;;
+    wait-ready-for-dev)
+        wait_ready_for_dev "$@"
+    ;;
+    up|down|up-all|down-all)
+        ruleset $cmd "$@"
+    ;;
+    *)
+        (($OPT_DEBUG == 0)) && pdie "$UNKNOWN_COMMAND_ERROR" $(get_current_file_name) $cmd
+    ;;
+esac

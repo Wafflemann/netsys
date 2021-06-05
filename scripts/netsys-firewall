@@ -1,0 +1,1302 @@
+#!/bin/bash
+
+localDir=$(dirname $0)
+
+source $localDir/netsys-base --lib
+
+#NO_COMMAND_ERROR='%s(): No command specified'
+#UNKNOWN_COMMAND_ERROR="%s(): Unknown command:'%s'"
+
+# (function)
+init_folders_and_files() {
+    if create_dir $FIREWALL_SYS_RUN_DIR 750; then
+        install_null_file $FIREWALL_SYS_ACTIVE_FWS_FILE 640
+        install_null_file $FIREWALL_SYS_INACTIVE_FWS_FILE 640
+    fi
+} # => init_folders_and_files()
+
+# (function)
+check_dev_name_exists() {
+    check_val '--dev-name' $DEV_NAME
+} # => check_dev_name_exists()
+
+# (function args)
+# $1 - devName
+has_config_for_dev() {
+    [ -f "$FIREWALL_SYS_LIB_DIR/d_$1.conf" ] && return 0
+    return 1
+} # => has_config_for_dev()
+
+# (function args)
+# $1 - devName
+get_config_file_location() {
+    local confFileLocation=''
+
+    if [ -n "$CONF_FILE_LOCATION" ]; then
+        confFileLocation=$CONF_FILE_LOCATION
+    elif [ -n "$1" ]; then
+        confFileLocation="$FIREWALL_SYS_LIB_DIR/d_$1.conf"
+    else
+        return 1
+    fi
+
+    if [ -n "$confFileLocation" ] && [ ! -f "$confFileLocation" ]; then
+        die "No firewall config at: $confFileLocation"
+    fi
+
+    echo $confFileLocation
+
+    return 0
+} # => get_config_file_location()
+
+# (function)
+write_config_to_tmp() {
+    local confFileLocation=$(create_tmp_file $(date +'%H:%M:%S')-$(gen_rand_string 6).conf)
+
+    cat /dev/stdin >$confFileLocation
+
+    if [ -s "$confFileLocation" ]; then
+        echo "$confFileLocation"
+        return 0
+    fi
+
+    return 1
+} # => write_config_to_tmp()
+
+# (function args)
+# $1 - fwName
+is_fw_active() {
+    file_contains_line $FIREWALL_SYS_ACTIVE_FWS_FILE $1
+
+    return $?
+} # => is_fw_active()
+
+# (function args)
+# $1 - fwName
+is_fw_inactive() {
+    file_contains_line $FIREWALL_SYS_INACTIVE_FWS_FILE $1
+
+    return $?
+} # => is_fw_inactive()
+
+# (function args)
+# $1 - fwName
+set_fw_active() {
+    sed -i -r -e "/$1/ d" $FIREWALL_SYS_INACTIVE_FWS_FILE
+    echo "$1" >>$FIREWALL_SYS_ACTIVE_FWS_FILE
+} # => set_fw_active()
+
+# (function args)
+# $1 - fwName
+set_fw_inactive() {
+    sed -i -r -e "/$1/ d" $FIREWALL_SYS_ACTIVE_FWS_FILE
+    echo "$1" >>$FIREWALL_SYS_INACTIVE_FWS_FILE
+} # => set_fw_inactive()
+
+declare -Ax RELATED_FAMILIES_MAP
+declare -Ax RELATED_TABLES_MAP
+declare -Ax RELATED_CHAINS_MAP
+declare -Ax RELATED_HANDLES_MAP
+
+declare -Ax NFT_ARRAYS
+
+NFT_ARRAY_REF_NAMES=(familyNames families tableNames tables chainNames chains handles chainDeps ruleDeps)
+NFT_FILE_ARRAY_NAMES=(F_FAMILY_NAMES F_FAMILIES F_TABLE_NAMES F_TABLES F_CHAIN_NAMES F_CHAINS F_HANDLES F_CHAIN_DEPS F_RULE_DEPS)
+NFT_RUNTIME_ARRAY_NAMES=(R_FAMILY_NAMES R_FAMILIES R_TABLE_NAMES R_TABLES R_CHAIN_NAMES R_CHAINS R_HANDLES R_CHAIN_DEPS R_RULE_DEPS)
+NFT_ARRAY_TYPE=(NFT_FILE_ARRAY_NAMES NFT_RUNTIME_ARRAY_NAMES)
+
+# [INIT ARRAYS]
+for ((typeIndex=0; typeIndex < ${#NFT_ARRAY_TYPE[@]}; typeIndex++))
+do
+    declare -n typeNamesRef="${NFT_ARRAY_TYPE[$typeIndex]}"
+    for ((nameIndex=0; nameIndex < ${#typeNamesRef[@]}; nameIndex++))
+    do
+        nftArrayName="${typeNamesRef[$nameIndex]}"
+        if grep -Eq '^.+_NAMES$' <<<$nftArrayName; then
+            declare -ax $nftArrayName
+        else
+            declare -Ax $nftArrayName
+        fi
+
+        NFT_ARRAYS[$typeIndex,${NFT_ARRAY_REF_NAMES[$nameIndex]}]="$nftArrayName"
+    done
+
+    unset nftArrayName
+    unset nameArrayRef
+done
+
+# (function args)
+# $1 - nftArrayType
+get_nft_array_info() {
+    { [ -n "$1" ] || die "No NFT array type supplied"; } && \
+        { { [ "$1" == 'file' ] && local arrayType=0; } || local arrayType=1; } && shift
+
+    local typeIndex=0 refName='' arrName=''
+    while read -r loc_val; do
+        typeIndex=$(sed -rn -e "s/'[[]($RE_D),.+/\1/p" <<<${loc_val@Q})
+        if [ $typeIndex -eq $arrayType ]; then
+            refName="$(sed -rn -e "s/.+,($RE_W)[]].+/\1/p" <<<${loc_val@Q})"
+            arrName="$(sed -rn -e "s/.+=\"($RE_W)\"'/\1/p" <<<${loc_val@Q})"
+
+            printf '%s=%s\n' "$refName" "$arrName"
+        fi
+    done < <(associative_array 'NFT_ARRAYS' output:index,key,value)
+} # => get_nft_array_info()
+
+NFT_TABLE='table'
+NFT_FAMILY='family'
+NFT_CHAIN='chain'
+NFT_RULE='rule'
+NFT_HANDLE='handle'
+
+NFT_FAM_INET='inet' NFT_FAM_IP='ip'
+
+RE_RLE='[a-zA-Z0-9 /_\,\.:{}%\"-]*'
+
+# (function args)
+# STDIN - /dev/stdin
+parse_nft_config() {
+    local tbl_ident="^\($NFT_TABLE\)$RE_S\($NFT_FAM_INET\|$NFT_FAM_IP\)$RE_S\($RE_W\).*\$"
+    local chn_ident="^$RE_S\($NFT_CHAIN\)$RE_S\($RE_W\)$RE_S.*\$"
+    local rle_ident="^$RE_S\($RE_RLE\)\([#]$RE_S\handle$RE_S\)*\($RE_FS\)*\($RE_D\)*\($RE_S[#].*\)*\($RE_FS\)*\$"
+
+    sed -e "/^$RE_S[#].*\$/d" \
+        -e "/^$RE_S}\$/d" \
+        -e "/^$RE_S\$/d" \
+        -ne "s/$rle_ident/\1$RE_FS\4$RE_FS/" \
+        -ne "s/$tbl_ident/\1\2\3/" \
+        -ne "s/$chn_ident/\1\2/" \
+        -e "s/^\(.*\)\($RE_FS\)\($RE_FS\)/\1\2/" \
+        -e "s/$tbl_ident/\1$RE_FS\2$RE_FS\3$RE_FS/p" \
+        -e "s/$chn_ident/\1$RE_FS\2$RE_FS/p" \
+        -e "s/$rle_ident/\1\3\4\6/p" /dev/stdin |
+    awk -F$RE_FS '{
+        switch ($1) {
+            case "'$NFT_TABLE'":
+                printf("'$NFT_FAMILY':%s\n'$NFT_TABLE':%s\n", $2, $3)
+                break
+            case "'$NFT_CHAIN'":
+                printf("'$NFT_CHAIN':%s\n", $2)
+                break
+            default:
+                if ($2) {
+                    printf("'$NFT_RULE':%s|'$NFT_HANDLE':%s\n", $1, $2)
+                } else {
+                    printf("'$NFT_RULE':%s\n", $1)
+                }
+        }
+    }' | sed -r -e 's|^(.*)[[:space:]]+([|]handle.+)$|\1\2|'
+}
+
+export STORE_LAST_ARRAY_TYPE=''
+
+# (function)
+reset_store_values() {
+    export STORE_F=-1 STORE_T=0 STORE_C=0 STORE_R=0
+    export STORE_TABLE_INDEX=-1 STORE_CHAIN_INDEX=-1
+} # => reset_store_values()
+
+# (function args)
+# $1 - nftArrayType
+# $2+ - options
+store_ruleset() {
+    { { [ -n "$1" ] && local nftArrayType="$1"; } || die 'No NFT arrayType supplied'; } && shift
+    [ "$nftArrayType" != "$STORE_LAST_ARRAY_TYPE" ] && reset_store_values
+
+    STORE_LAST_ARRAY_TYPE="$nftArrayType"
+    
+    local refName='' arrName=''
+    while read -r arrayInfo; do
+        refName="${arrayInfo%%=*}" arrName="${arrayInfo#*=}"
+        local "arrName_$refName"="$arrName"
+        declare -n $refName="$arrName"
+    done < <(get_nft_array_info $nftArrayType)
+
+    local opt_configFile='' opt_family='' opt_table='' opt_chain='' opt_writeChainFiles=0
+    local opt='' val='' emptyOk=0
+    for arg in "$@"
+    do
+        emptyOk=0
+        opt="$(get_arg_opt $arg)"
+        val="$(get_arg_val $arg)"
+
+        case "$opt" in
+            configFile)
+                opt_configFile="$val"
+            ;;
+            family)
+                opt_family="$val"
+            ;;
+            table)
+                opt_table="$val"
+            ;;
+            chain)
+                opt_chain="$val"
+            ;;
+            write-chain-files)
+                { [ "$opt" != "$val" ] && local chainFileDir="$val"; } || local chainFileDir=$TMP_DIR
+                opt_writeChainFiles=1
+                emptyOk=1
+            ;;
+            *)
+                die "${FUNCNAME[0]}(): Unknown option: '$opt'"
+            ;;
+        esac
+
+        if (($emptyOk == 0)) && { [ "$val" = "$arg" ] || [ -z "$val" ]; }; then
+            die "${FUNCNAME[0]}(): Missing value to option: $opt"
+        fi
+    done
+
+    ((opt_writeChainFiles == 1)) && local chainFileName='' nftInterpreterLine='#!/usr/sbin/nft -f' chainFileTxt=''
+    local tableName='' familyName='' chainName='' str='' rule='' handle=''
+    while read -r line; do
+        case "$line" in
+            $(awk "{a=0}/$NFT_FAMILY:.+/{a=1}a" <<<${line}))
+                familyName=$(sed -r -e "s/$NFT_FAMILY:(.+)/\1/" <<<"$line")
+
+                [ -v chainFileTxt ] && chainFileTxt="${nftInterpreterLine}${NEWLINE}table $familyName"
+
+                old_array_contains "$familyName" "$arrName_familyNames" && continue
+                let STORE_F=$STORE_F+1 STORE_T=0
+
+                familyNames[$STORE_F]="$familyName"
+            ;;
+            $(awk "{a=0}/$NFT_TABLE:.+/{a=1}a" <<<${line}))
+                tableName=$(sed -r -e "s/$NFT_TABLE:(.+)/\1/" <<<"$line")
+
+                [ -v chainFileTxt ] && chainFileTxt="$chainFileTxt $tableName {"
+
+                old_array_contains "$tableName" "$arrName_tableNames" && continue
+                let STORE_TABLE_INDEX=$STORE_TABLE_INDEX+1
+
+                families[$STORE_F,$STORE_T]=$STORE_TABLE_INDEX
+                tableNames[$STORE_TABLE_INDEX]="$tableName"
+
+                let STORE_T=$STORE_T+1 STORE_C=0
+            ;;
+            $(awk "{a=0}/$NFT_CHAIN:.+/{a=1}a" <<<${line}))
+                chainName=$(sed -r -e "s/$NFT_CHAIN:(.+)/\1/" <<<"$line")
+                old_array_contains "$chainName" "$arrName_chainNames" && continue
+                let STORE_CHAIN_INDEX=$STORE_CHAIN_INDEX+1
+
+                if [ -v chainFileName ]; then
+                    if [ -n "$chainFileName" ] && [ -f "$chainFileDir/$chainFileName" ]; then
+                        echo "${TAB}}${NEWLINE}}" >>$chainFileDir/$chainFileName
+                    fi
+
+                    chainFileName="${nftArrayType}_${tableName}_${chainName}"
+
+                    echo "$chainFileTxt${NEWLINE}${TAB}chain $chainName {" >$chainFileDir/$chainFileName
+                fi
+
+                tables[$STORE_TABLE_INDEX,$STORE_C]=$STORE_CHAIN_INDEX
+                chainNames[$STORE_CHAIN_INDEX]="$chainName"
+
+                let STORE_C=$STORE_C+1 STORE_R=0
+            ;;
+            $(awk "{a=0}/$NFT_RULE:.+/{a=1}a" <<<${line}))
+                str=$(sed -r -e "s/^$NFT_RULE:($RE_RLE)(\|$NFT_HANDLE:)*(.+)*\$/\1\|\3/" <<<"$line")
+                rule=${str%|*}
+                handle=${str#*|}
+
+                [ -v chainFileName ] && echo "${TAB}${TAB}$rule" >>$chainFileDir/$chainFileName
+
+                chains[$STORE_CHAIN_INDEX,$STORE_R]="$rule"
+                if [ "$handle" ]; then
+                    handles[$STORE_CHAIN_INDEX,$STORE_R]="$handle"
+                fi
+
+                let STORE_R=$STORE_R+1
+            ;;
+        esac
+    done < <(
+        case "$nftArrayType" in
+            file)
+                if [ -n "$opt_configFile" ]; then
+                    cat $opt_configFile | parse_nft_config
+                else
+                    cat /dev/stdin | parse_nft_config
+                fi
+            ;;
+            runtime)
+                if [ -n "$opt_chain" ]; then
+                    nft list chain $opt_family $opt_table $opt_chain -a | parse_nft_config
+                else
+                    nft list table $opt_family $opt_table -a | parse_nft_config
+                fi
+            ;;
+        esac
+    )
+} # => store_ruleset
+
+# (function args)
+# $1 - devFirewallConfigLocation
+load_related_runtime_data() {
+    local familyName='' tableName=''
+    local tIndex=0
+    local fIndexLength=0
+    {
+        for ((fIndex=0; fIndex < ${#F_FAMILY_NAMES[@]}; fIndex++))
+        do
+            familyName="${F_FAMILY_NAMES[$fIndex]}"
+
+            fIndexLength=$(associative_array 'F_FAMILIES' find:index-length index:$fIndex)
+            for ((fKey=0; fKey < $fIndexLength; fKey++))
+            do
+                tIndex=${F_FAMILIES[$fIndex,$fKey]}
+                tableName="${F_TABLE_NAMES[$tIndex]}"
+
+                store_ruleset runtime family:$familyName table:$tableName
+            done
+        done
+    }
+} # => load_related_runtime_data()
+
+# (function args)
+# $1 - chainSetLineSTR
+get_cIndex() {
+    sed -r -e "s/.+\,cIndex:($RE_D)/\1/" <<<"$1"
+} # => get_cIndex()
+
+# (function args)
+# $1 - chainSetLineSTR
+get_tKey() {
+    sed -r -e "s/tKey:($RE_D)\,.+/\1/" <<<"$1"
+} # => get_tKey()
+
+RE_GROUP_FILTER='accept|drop|reject'
+RE_GROUP_NAT='snat|dnat|masquerade|redirect'
+RE_GROUP_LEAP='jump|goto'
+
+# (function args)
+# $1 - rule
+get_rule_action_type() {
+    case "$@" in
+        $(awk "{a=0}/.+($RE_GROUP_FILTER).*/{a=1}a" <<<"$@"))
+            echo "filter"
+        ;;
+        $(awk "{a=0}/.+($RE_GROUP_NAT).*/{a=1}a" <<<"$@"))
+            echo "nat"
+        ;;
+        $(awk "{a=0}/.+($RE_GROUP_LEAP).*/{a=1}a" <<<"$@"))
+            echo "leap"
+        ;;
+    esac
+} # => get_rule_action_type()
+
+# (function args) --------Is it worth just grouping the actionTypes together with an OR?--------
+# $1 - ruleActionType
+# $2 - rule
+get_rule_expression() {
+    { { [ -n "$1" ] && local actionType="$1"; } || die "${FUNCNAME[0]}(): No ruleActionType specified"; } && shift
+
+    case "$actionType" in
+        filter)
+            sed -r -ne "s/(.+)($RE_GROUP_FILTER).*/\1/p" <<<"$@"
+        ;;
+        nat)
+            sed -r -ne "s/(.+)($RE_GROUP_NAT).*/\1/p" <<<"$@"
+        ;;
+        leap)
+            sed -r -ne "s/(.+)($RE_GROUP_LEAP).*/\1/p" <<<"$@"
+        ;;
+    esac
+} # => get_rule_expression()
+
+# (function args) --------Is it worth just grouping the actionTypes together with an OR?--------
+# $1 - ruleActionType
+# $2 - rule
+get_rule_statement() {
+    { { [ -n "$1" ] && local actionType="$1"; } || die "${FUNCNAME[0]}(): No ruleActionType specified"; } && shift
+
+    case "$actionType" in
+        filter)
+            sed -r -ne "s/.+($RE_GROUP_FILTER)$RE_S(.+)*/\1\|\2/p" <<<"$@"
+        ;;
+        nat)
+            sed -r -ne "s/.+($RE_GROUP_NAT)$RE_S(.+)*/\1\|\2/p" <<<"$@"
+        ;;
+        leap)
+            sed -r -ne "s/.+($RE_GROUP_LEAP)$RE_S(.+)*/\1\|\2/p" <<<"$@"
+        ;;
+    esac
+} # => get_rule_statement()
+
+# (function args)
+# $1 - nftArrayType
+process_dependencies() {
+    { { [ -n "$1" ] && local nftArrayType="$1"; } || die 'No NFT arrayType supplied'; } && shift
+
+    local refName='' arrName=''
+    while read -r arrayInfo; do
+        refName="${arrayInfo%%=*}" arrName="${arrayInfo#*=}"
+        local "arrName_$refName"="$arrName"
+        declare -n $refName="$arrName"
+    done < <(get_nft_array_info $nftArrayType)
+
+    local rule='' ruleActionType='' ruleStatement='' ruleChainDep=''
+    local dep_cIndex=0 cDeps_key=0
+    local cIndexLength=0
+    {
+        local largest_cIndex=$(associative_array "$arrName_chains" find:largest-index)
+        for ((cIndex=0; cIndex <= $largest_cIndex; cIndex++))
+        do
+            cIndexLength=$(associative_array "$arrName_chains" find:index-length index:$cIndex)
+            for ((cKey=0; cKey < $cIndexLength; cKey++))
+            do
+                rule="${chains[$cIndex,$cKey]}"
+                ruleActionType=$(get_rule_action_type "$rule")
+                if [ "$ruleActionType" == 'leap' ]; then
+                    ruleStatement="$(get_rule_statement $ruleActionType "$rule")"
+                    ruleChainDep="${ruleStatement#*|}"
+
+                    dep_cIndex=$(array_value_location "$ruleChainDep" "$arrName_chainNames")
+                    if (($dep_cIndex > -1)); then
+                        cDeps_key=$(associative_array "$arrName_chainDeps" find:index-length index:$dep_cIndex)
+                        chainDeps[$dep_cIndex,$cDeps_key]="${cIndex},${cKey}"
+                    fi
+
+                    ruleDeps[$cIndex,$cKey]="$dep_cIndex"
+                fi
+            done
+        done
+    }
+} # => process_dependencies()
+
+# (function args)
+# $1 - ruleActionType
+# $2 - runtime_cIndex
+# $3 - rule
+get_related_rule_by_expression() {
+    { { [ -n "$1" ] && local actionType="$1"; } || die "${FUNCNAME[0]}(): No ruleActionType specified"; } && shift
+    { { [ -n "$1" ] && local r_cIndex="$1"; } || die "${FUNCNAME[0]}(): No runtime_cIndex specified"; } && shift
+
+    local ruleExpression="$(get_rule_expression $actionType "$@")" r_rule=''
+    {
+        local r_cIndexLength=$(associative_array 'R_CHAINS' find:index-length index:$r_cIndex)
+	for ((r_cKey=0; r_cKey < $r_cIndexLength; r_cKey++))
+        do
+            r_rule="${R_CHAINS[$r_cIndex,$r_cKey]}"
+            if [ "$(get_rule_expression $actionType "$r_rule")" == "$ruleExpression" ]; then
+                echo "${r_cIndex},${r_cKey}=$r_rule"
+                return 0
+            fi
+
+        done
+    }
+
+    return 1
+} # => get_related_rule_by_expression()
+
+# (function)
+get_related_indicies() {
+    local typePrefix='' refName='' arrName=''
+    declare -a nftArrayTypes=('file' 'runtime')
+    for nftArrayType in ${nftArrayTypes[*]}
+    do
+        { [ "$nftArrayType" == 'file' ] && typePrefix='f_'; } \
+            || { [ "$nftArrayType" == 'runtime' ] && typePrefix='r_'; }
+        while read -r arrayInfo; do
+            refName="${typePrefix}${arrayInfo%%=*}" arrName="${arrayInfo#*=}"
+            local "name_${refName}"="$arrName"
+            declare -n $refName="$arrName"
+        done < <(get_nft_array_info "$nftArrayType")
+    done
+
+    local familiesTmp='' tablesTmp='' chainsTmp=''
+
+    local familyName='' tableName='' chainName='' rule=''
+    local tIndex=0 cIndex=0 runtime_tIndex=0
+    local r_fIndex=0 r_tIndex=0 r_cIndex=0
+    local fIndexLength=0 tIndexLength=0 cIndexLength=0
+    {
+        for ((fIndex=0; fIndex < ${#f_familyNames[@]}; fIndex++))
+        do
+            familyName="${f_familyNames[$fIndex]}"
+            r_fIndex=$(array_value_location "$familyName" "$name_r_familyNames")
+
+            fIndexLength=$(associative_array "$name_f_families" find:index-length index:$fIndex)
+            for ((fKey=0; fKey < $fIndexLength; fKey++))
+            do
+                tIndex=${f_families[$fIndex,$fKey]}
+                tableName="${f_tableNames[$tIndex]}"
+                r_tIndex=$(array_value_location "$tableName" "$name_r_tableNames")
+
+                RELATED_FAMILIES_MAP[$fIndex,$fKey]="$(associative_array "$name_r_families" find:location index:$r_fIndex value:$r_tIndex)"
+
+                tIndexLength=$(associative_array "$name_f_tables" find:index-length index:$tIndex)
+                for ((tKey=0; tKey < $tIndexLength; tKey++))
+                do
+                    cIndex=${f_tables[$tIndex,$tKey]}
+                    chainName="${f_chainNames[$cIndex]}"
+                    r_cIndex=$(array_value_location "$chainName" "$name_r_chainNames")
+
+                    RELATED_TABLES_MAP[$tIndex,$tKey]="$(associative_array "$name_r_tables" find:location index:$r_tIndex value:$r_cIndex)"
+
+                    cIndexLength=$(associative_array "$name_f_chains" find:index-length index:$cIndex)
+                    for ((cKey=0; cKey < $cIndexLength; cKey++))
+                    do
+                        rule="${f_chains[$cIndex,$cKey]}"
+
+                        RELATED_CHAINS_MAP[$cIndex,$cKey]="$(associative_array "$name_r_chains" find:location index:$r_cIndex value:"$rule")"
+                    done
+                done
+            done
+        done
+    }
+} # => get_related_indicies()
+
+# (function)
+get_related_chains() {
+    local familyName='' tableName='' chainName='' rule=''
+    local fIndex=-1 tIndex=-1 tKey=-1
+    local cIndexLength=0
+    local r_currentIndex=-1 r_fIndex=-1 r_tIndex=-1 r_cIndex=-1
+    local r_fIndexLength=0 r_tIndexLength=0
+    {
+        local cIndex_loc=''
+        local largest_cIndex=$(associative_array 'F_CHAINS' find:largest-index)
+        for ((cIndex=0; cIndex <= $largest_cIndex; cIndex++))
+        do
+            r_fIndex=-1 r_tIndex=-1 r_cIndex=-1
+
+            cIndex_loc=$(associative_array 'F_TABLES' find:location value:$cIndex)
+            tIndex=$(sed -r -e "s/($RE_D),.+/\1/" <<<"$cIndex_loc")
+            tKey=$(sed -r -e "s/.+,($RE_D)/\1/" <<<"$cIdnex_loc")
+
+            fIndex=$(associative_array 'F_FAMILIES' find:location value:$tIndex | \
+                sed -r -e "s/($RE_D),.+/\1/")
+
+            familyName="${F_FAMILY_NAMES[$fIndex]}"
+            tableName="${F_TABLE_NAMES[$tIndex]}"
+            chainName="${F_CHAIN_NAMES[$cIndex]}"
+            store_ruleset runtime family:$familyName table:$tableName chain:$chainName
+
+            r_fIndex=$(array_value_location "$familyName" 'R_FAMILY_NAMES')
+
+            (($r_fIndex < 0)) && continue
+
+            r_fIndexLength=$(associative_array 'R_FAMILIES' find:index-length index:$r_fIndex)
+            for ((r_fKey=0; r_fKey < $r_fIndexLength; r_fKey++))
+            do
+                r_currentIndex=${R_FAMILIES[$r_fIndex,$r_fKey]}
+                if [ "${R_TABLE_NAMES[$r_currentIndex]}" == "$tableName" ]; then
+                    r_tIndex=$r_currentIndex
+                    break
+                fi
+            done
+
+            (($r_tIndex < 0)) && continue
+
+	    r_tIndexLength=$(associative_array 'R_TABLES' find:index-length index:$r_tIndex)
+            for ((r_tKey=0; r_tKey < $r_tIndexLength; r_tKey++))
+            do
+                r_currentIndex=${R_TABLES[$r_tIndex,$r_tKey]}
+                if [ "${R_CHAIN_NAMES[$r_currentIndex]}" == "$chainName" ]; then
+                    r_cIndex=$r_currentIndex
+                    break
+                fi
+            done
+
+            (($r_cIndex < 0)) && continue
+
+	    cIndexLength=$(associative_array 'F_CHAINS' find:index-length index:$cIndex)
+            for ((cKey=0; cKey < $cIndexLength; cKey++))
+            do
+                rule="${F_CHAINS[$cIndex,$cKey]}"
+
+                RELATED_CHAINS_MAP[$cIndex,$cKey]=$(associative_array 'R_CHAINS' find:location index:$r_cIndex value:"$rule")
+            done
+        done
+    }
+} # => get_related_chains()
+
+# (function args)
+# $1 - cmd
+# $2 - nftModel
+# $3+ - options
+exec_against_runtime() {
+    { { [ -n "$1" ] && local cmd="$1"; } || die "${FUNCNAME[0]}(): No command specified"; } && shift
+    { { [ -n "$1" ] && local nftModel="$1"; } || die "${FUNCNAME[0]}(): No NFT model type specified"; } && shift
+
+    local opt='' val='' emptyOk=0
+    local key='' fIndex='' tIndex='' cIndex='' configFile='' overwriteChains=0 overwriteRules=1 runtimeCheck=0
+    for arg in "$@"
+    do
+        emptyOk=0
+        opt="$(get_arg_opt $arg)"
+        val="$(get_arg_val $arg)"
+
+        case "$opt" in
+            key)
+                key=$val
+            ;;
+            fIndex)
+                fIndex=$val
+            ;;
+            tIndex)
+                tIndex=$val
+            ;;
+            cIndex)
+                cIndex=$val
+            ;;
+            configFile)
+                configFile="$val"
+            ;;
+            chainOverwrite)
+                overwriteChains=1
+                emptyOk=1
+            ;;
+            noRuleOverwrite)
+                overwriteRules=0
+                emptyOk=1
+            ;;
+            runtimeCheck)
+                runtimeCheck=$val
+            ;;
+        esac
+
+        if (($emptyOk == 0)) && { [ "$val" = "$arg" ] || [ -z "$val" ]; }; then
+            die "${FUNCNAME[0]}(): Missing value to option: $opt"
+        fi
+    done
+
+    local relatedLocation=''
+    local f_familyName='' f_tableName='' f_chainName='' f_rule=''
+    local f_cIndex=-1
+    local assocIndex=-1 assocKey=-1
+    local r_chainName='' r_rule='' r_handle=''
+    local r_cIndex=-1
+    case "$nftModel" in
+        ruleset)
+            case "$cmd" in
+                insert)
+                    info "Loading config file: $configFile into nftables"
+                    nft -f $configFile
+                ;;
+                merge)
+                    die 'NOT IMPLEMENTED'
+                ;;
+            esac
+        ;;
+        table)
+            die 'NOT IMPLEMENTED'
+        ;;
+        chain) #- [$key in this context is tKey]
+            f_familyName="${F_FAMILY_NAMES[$fIndex]}"
+            f_tableName="${F_TABLE_NAMES[$tIndex]}"
+
+            case "$cmd" in
+                merge)
+                    f_cIndex=${F_TABLES[$tIndex,$key]}
+		    f_chainName="${F_CHAIN_NAMES[$f_cIndex]}"
+
+                    local chainFileLocation="$TMP_DIR/file_${f_tableName}_${f_chainName}"
+                    if [ -f "$chainFileLocation" ]; then
+                        if ! old_array_contains "$f_chainName" 'R_CHAIN_NAMES'; then
+                            info "Adding Chain: $f_chainName to Table: $f_tableName using file: $chainFileLocation"
+                            nft -f $chainFileLocation
+
+                            printf 'ADD|F|C|%s,%s' ${tIndex} ${key}
+                            return 0
+                        elif (($overwriteChains == 1)); then #- B/c of rule modify, pry not suggested to use this
+                            r_cIndex=$(array_value_location "$f_chainName" 'R_CHAIN_NAMES')
+
+                            declare -a deletedRules
+                            local dep_ruleAddr='' dep_cIndex=-1 dep_cKey=-1
+                            local dep_chainName='' dep_rule='' dep_handle=''
+                            local dIndexLength=$(associative_array 'R_CHAIN_DEPS' find:index-length index:$r_cIndex)
+			    for ((dKey=0; dKey < $dIndexLength; dKey++))
+                            do
+                                dep_ruleAddr=${R_CHAIN_DEPS[$dIndex,$dKey]}
+
+                                if [ -n "$dep_ruleAddr" ]; then
+                                    dep_cIndex=$(get_address_index $dep_ruleAddr)
+                                    dep_cKey=$(get_address_key $dep_ruleAddr)
+
+                                    dep_chainName="${R_CHAIN_NAMES[$dep_cIndex]}"
+                                    dep_rule="${R_CHAINS[$dep_cIndex,$dep_cKey]}"
+                                    dep_handle=${R_HANDLES[$dep_cIndex,$dep_cKey]}
+
+                                    info "Deleting Rule: $dep_rule from Chain: $dep_chainName for its dependency on Chain: $f_chainName"
+                                    nft delete rule $f_familyName $f_tableName $dep_chainName handle $dep_handle
+
+                                    deletedRules+=("$dep_ruleAddr")
+                                fi
+                            done
+
+                            info "Deleting Chain: $f_chainName from Table: $f_tableName"
+                            nft delete chain $f_familyName $f_tableName $f_chainName
+
+                            info "Adding Chain: $f_chainName to Table: $f_tableName using file: $chainFileLocation"
+                            nft -f $chainFileLocation
+
+                            for ruleAddress in $deletedRules
+                            do
+                                dep_cIndex=$(get_address_index $ruleAddress)
+                                dep_cKey=$(get_address_key $ruleAddress)
+
+                                dep_chainName="${R_CHAIN_NAMES[$dep_cIndex]}"
+                                dep_rule="${R_CHAINS[$dep_cIndex,$dep_cKey]}"
+
+                                info "Adding Rule: $dep_rule to Chain: $dep_chainName with its dependency on Chain: $f_chainName"
+                                nft add rule $f_familyName $f_tableName $dep_chainName $dep_rule
+                            done
+
+                            local r_chainAddr=$(associative_array 'R_TABLES' find:location value:$r_cIndex)
+                            r_tIndex=$(get_address_index $r_chainAddr)
+                            r_tKey=$(get_address_key $r_chainAddr)
+                            echo 'REP|R|C|%s,%s<F|C|%s,%s' $r_tIndex $r_tKey $tIndex $key
+                            return 0
+                        else
+                            return 2
+                        fi
+                    else
+                        warn "Unable to merge Chain: $f_chainName because no chain config file found"
+                    fi
+
+                    return 1
+                ;;
+                remove)
+		    if (($runtimeCheck != 1)); then
+                        f_cIndex=${F_TABLES[$tIndex,$key]}
+                        f_chainName="${F_CHAIN_NAMES[$f_cIndex]}"
+
+                        info "Deleting Chain: $f_chainName from Table: $f_tableName"
+                        nft delete chain $f_familyName $f_tableName $f_chainName
+
+                        printf 'DEL|F|C|%s,%s' ${tIndex} ${key}
+                        return 0
+                    else
+                        relatedLocation="${RELATED_TABLES_MAP[$tIndex,$key]}"
+                        if [ -n "$relatedLocation" ]; then
+                            assocIndex=${relatedLocation%,*}
+                            assocKey=${relatedLocation#*,}
+
+                            r_cIndex=${R_TABLES[$assocIndex,$assocKey]}
+                            r_chainName="${R_CHAIN_NAMES[$r_cIndex]}"
+
+                            info "Deleting Chain: $r_chainName from Table: $f_tableName"
+                            nft delete chain $f_familyName $f_tableName $r_chainName
+
+                            printf 'DEL|R|C|%s,%s' ${assocIndex} ${assocKey}
+                            return 0
+                        else
+                            f_cIndex=${F_TABLES[$tIndex,$key]}
+                            f_chainName=${F_CHAIN_NAMES[$f_cIndex]}
+                            warn "Unable to delete Chain: $f_chainName because of failed runtime check"
+                        fi
+                    fi
+
+                    return 1
+                ;;
+            esac
+        ;;
+        rule) #- [$key in this context is cKey]
+            f_familyName="${F_FAMILY_NAMES[$fIndex]}"
+            f_tableName="${F_TABLE_NAMES[$tIndex]}"
+
+            case "$cmd" in
+                merge)
+                    f_chainName="${F_CHAIN_NAMES[$cIndex]}"
+                    f_rule="${F_CHAINS[$cIndex,$key]}"
+
+                    relatedLocation="${RELATED_CHAINS_MAP[$cIndex,$key]}"
+                    if [ -n "$relatedLocation" ]; then
+                        return 2
+                    else #- Not using relatedLocations because the file & runtime rules are different
+                        r_cIndex=$(array_value_location "$f_chainName" 'R_CHAIN_NAMES')
+
+                        ((r_cIndex < 0)) && return 1
+
+                        local f_ruleActionType="$(get_rule_action_type $f_rule)" ruleInfo=''
+			if ruleInfo="$(get_related_rule_by_expression $f_ruleActionType $r_cIndex $f_rule)"; then
+                            r_rule="${ruleInfo#*=}"
+
+                            if (($overwriteRules == 1)); then
+                                local r_cKey="$(get_address_key ${ruleInfo%=*})"
+                                local r_handle=${R_HANDLES[$r_cIndex,$r_cKey]}
+
+                                info "Replacing Rule: $f_rule at Handle: $r_handle to Chain: $f_chainName"
+                                nft replace rule $f_familyName $f_tableName $f_chainName handle $r_handle $f_rule
+
+                                printf 'REP|R|R|%s,%s<F|R|%s,%s#%s' $r_cIndex $r_cKey $cIndex $key $r_handle
+                                return 0
+                            else
+                                return 3
+                            fi
+                        else
+                            info "Adding Rule: $f_rule to Chain: $f_chainName"
+                            nft add rule $f_familyName $f_tableName $f_chainName $f_rule
+
+                            printf 'ADD|F|R|%s,%s' $cIndex $key
+                            return 0
+                        fi
+                    fi
+                ;;
+                remove)
+                    relatedLocation="${RELATED_CHAINS_MAP[$cIndex,$key]}"
+                    if [ -n "$relatedLocation" ]; then
+                        assocIndex=${relatedLocation%,*}
+                        assocKey=${relatedLocation#*,}
+
+                        r_chainName="${R_CHAIN_NAMES[$assocIndex]}"
+                        r_rule="${R_CHAINS[$assocIndex,$assocKey]}"
+                        r_handle="${R_HANDLES[$assocIndex,$assocKey]}"
+
+                        info "Deleting Rule: $r_rule from Chain: $r_chainName"
+                        nft delete rule $f_familyName $f_tableName $r_chainName handle $r_handle
+
+                        echo $r_handle
+                        return 0
+                    else
+                        f_rule="${F_CHAINS[$cIndex,$key]}"
+                        warn "Unable to delete Rule: $f_rule because of failed runtime check"
+                    fi
+                ;;
+            esac
+        ;;
+    esac
+} # => exec_against_runtime()
+
+# (function args)
+# $1 - rule
+jump_chains_and_get_set() {
+    if grep -Eq "(^.+jump\s$RE_RLE\$)" <<< $1; then
+        declare -a chainSet
+
+        local chainToFollow="$(echo $1 | sed -r -e 's/.+jump\s(.+)/\1/')"
+        local follow_cIndex=$(array_value_location "$chainToFollow" 'F_CHAIN_NAMES')
+	if (($follow_cIndex > -1)); then
+            local tKey=$(associative_array 'F_TABLES' find:location index:$tIndex value:$follow_cIndex | \
+                    get_address_key)
+
+            local rule='' returnText=''
+            local cIndexLength=$(associative_array 'F_CHAINS' find:index-length index:$follow_cIndex)
+            for ((cKey=0; cKey < $cIndexLength; cKey++))
+            do
+                rule="${F_CHAINS[$follow_cIndex,$cKey]}"
+		returnText="$(jump_chains_and_get_set "$rule")" && chainSet=("$returnText" "${chainSet[@]}")
+            done
+
+            chainSet=("tKey:$tKey,cIndex:$follow_cIndex" "${chainSet[@]}")
+
+            if [ ${#chainSet[@]} -gt 0 ]; then
+                printf '%s\n' "${chainSet[@]}"
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
+} # => jump_chains_and_get_set()
+
+declare -a DELETED_CHAINS
+
+# (function args)
+# $1 - cmd
+# $2+ - params
+process_chain_modifications() {
+    { { [ -n "$1" ] && local cmd="$1"; } || die "${FUNCNAME[0]}(): No modify command supplied"; } && shift
+
+    local param='' val=''
+    local devName='' fIndex=-1 tIndex=-1 tKey=-1 cIndex=-1 chainName=''
+    for arg in "$@"
+    do
+        param="$(get_arg_opt $arg)"
+        val="$(get_arg_val $arg)"
+
+        case "$param" in
+            devName)
+                devName="$val"
+            ;;
+            fIndex)
+                fIndex=$val
+            ;;
+            tIndex)
+                tIndex=$val
+            ;;
+            tKey)
+                tKey="$val"
+            ;;
+            cIndex)
+                cIndex=$val
+            ;;
+            chainName)
+                chainName="$val"
+            ;;
+        esac
+
+        if [ "$val" = "$arg" ] || [ -z "$val" ]; then
+            die "${FUNCNAME[0]}(): Missing value to parameter: $param"
+        fi
+    done
+
+    [ -z "$devName" ] && die "${FUNCNAME[0]}(): param: 'devName' required"
+
+    case "$cmd" in
+        merge)
+            local execStatus=''
+            { $(exec_against_runtime $cmd chain runtimeCheck:$RUNTIME_CHECK \
+                fIndex:$fIndex tIndex:$tIndex key:$tKey >/dev/null);
+                local execStatus="$?"; }
+            case "$execStatus" in
+                0)
+                    return 0 #TODO, do record keeping
+                ;;
+                1)
+                    warn "${FUNCNAME[0]}(): Chain: $chainName config file not found. Not merging chain."
+                ;;
+                2)
+                    local rule=''
+
+                    #---NOTE/TODO pry should add logging
+                    local cIndexLength=$(associative_array 'F_CHAINS' find:index-length index:$cIndex)
+                    for ((cKey=0; cKey < $cIndexLength; cKey++))
+                    do
+                        { $(exec_against_runtime $cmd rule runtimeCheck:$RUNTIME_CHECK \
+                            fIndex:$fIndex tIndex:$tIndex cIndex:$cIndex key:$cKey >/dev/null);
+                            execStatus="$?"; }
+
+                        rule="${F_CHAINS[$cIndex,$cKey]}"
+
+                        case "$execStatus" in
+                            0)
+                                return 0 #TODO, do record keeping
+                            ;;
+                            1)
+                                warn "${FUNCNAME[0]}(): Not merging Rule: '$rule' Chain: $chainName doesn't exist."
+                            ;;
+                            2)
+                                warn "${FUNCNAME[0]}(): Not merging Rule: '$rule' exists for Chain: $chainName."
+                            ;;
+                            3)
+                                warn "${FUNCNAME[0]}(): Not merging Rule: '$rule'. older exists, Overwrite disabled."
+                            ;;
+                        esac
+                    done
+                ;;
+            esac
+        ;;
+        remove)
+            if ! old_array_contains $cIndex 'DELETED_CHAINS'; then
+                local rule='' chainSetSTR='' arrayKey=0
+                local cIndexLength=$(associative_array 'F_CHAINS' find:index-length index:$cIndex)
+                for ((cKey=0; cKey < $cIndexLength; cKey++))
+                do
+                    rule="${F_CHAINS[$cIndex,$cKey]}"
+                    if grep -Eq "(iifname\s\"$devName\"|oifname\s\"$devName\")" <<<"$rule" \
+                            && exec_against_runtime $cmd rule runtimeCheck:$RUNTIME_CHECK \
+                                fIndex:$fIndex tIndex:$tIndex cIndex:$cIndex key:$cKey >/dev/null \
+                            && chainSetSTR="$(jump_chains_and_get_set "$rule")";
+                    then
+                        while read -r line; do
+                            arrayKey=$(get_tKey $line)
+                            if exec_against_runtime $cmd chain runtimeCheck:$RUNTIME_CHECK \
+                                    fIndex:$fIndex tIndex:$tIndex key:$arrayKey >/dev/null;
+                            then
+                                DELETED_CHAINS+=("$(get_cIndex $line)")
+                            fi
+                        done <<<"$chainSetSTR"
+                    fi
+                done
+            fi
+        ;;
+    esac
+} # => process_chain_modifications()
+
+# (function args)
+# $1 - cmd
+# $2 - devName
+modify_runtime() {
+    local cmd="$1" devName="$2"
+
+    local refName='' arrName=''
+    while read -r arrayInfo; do
+        refName="${arrayInfo%%=*}" arrName="${arrayInfo#*=}"
+        local "arrName_$refName"="$arrName"
+        declare -n $refName="$arrName"
+    done < <(get_nft_array_info file)
+
+    local configFile=''
+    case "$cmd" in
+        insert)
+            { [ -p /dev/stdin ] && configFile="$(cat /dev/stdin | write_config_to_tmp)" \
+                || { [ -n "$devName" ] && configFile="$(get_config_file_location $devName)"; } } \
+            || die "${FUNCNAME[0]}(): No config available to insert"
+        ;;&
+        merge|remove)
+            { [ -p /dev/stdin ] \
+                && store_ruleset file write-chain-files <<<$(cat /dev/stdin); } \
+                || { [ -n "$devName" ] \
+                    && { configFile="$(get_config_file_location $devName)" \
+                    && store_ruleset file configFile:$configFile write-chain-files; } } \
+                || die "${FUNCNAME[0]}(): No config available to $cmd"
+        ;;&
+        insert|merge|remove)
+            [ -n "$devName" ] && local fwName="fw-${devName}" \
+                || { [ -n "$configFile" ] && local fwName="fw-$(sed -r -e 's|.+/(.+)\.conf|\1|' <<<"$configFile")"; }
+
+            { [ -n "$LOG_FILE_LOCATION" ] && local logFile="$LOG_FILE_LOCATION" \
+                || { ((LOG_ENABLED == 1)) && [ -n "$fwName" ] && local logFile="$FIREWALL_SYS_RUN_DIR/$fwName"; }
+            } && {
+                msg set-output file:$logFile permissions:$GBL_LOG_FILE_PERMISSIONS
+                msg enable-timestamp
+            }
+        ;;&
+        insert)
+            if is_fw_active $fwName; then
+                warn "Firewall: $fwName is already active"
+                return 1
+            fi
+
+            exec_against_runtime insert ruleset configFile:$configFile
+            set_fw_active $fwName
+        ;;
+        merge)
+        ;&
+        remove)
+            if ! is_fw_active $fwName; then
+                warn "Firewall: $fwName is not currently active."
+                return 1
+            fi
+
+            if (($RUNTIME_CHECK == 1)); then
+                load_related_runtime_data
+                get_related_indicies
+            else
+                get_related_chains
+            fi
+
+            local familyName='' tableName='' chainName=''
+            local tIndex=0 cIndex=0
+            local fIndexLength=0 tIndexLength=0
+            for ((fIndex=0; fIndex < ${#familyNames[@]}; fIndex++))
+            do
+                familyName="${familyNames[$fIndex]}" # TODO use for logging
+
+                fIndexLength=$(associative_array "$arrName_families" find:index-length index:$fIndex)
+                for ((fKey=0; fKey < $fIndexLength; fKey++))
+                do
+                    tIndex=${families[$fIndex,$fKey]}
+                    tableName="${tableNames[$tIndex]}" # TODO use for logging
+
+                    tIndexLength=$(associative_array "$arrName_tables" find:index-length index:$tIndex)
+                    for ((tKey=0; tKey < $tIndexLength; tKey++))
+                    do
+                        cIndex=${tables[$tIndex,$tKey]}
+                        chainName="${chainNames[$cIndex]}" # TODO use for logging
+
+                        process_chain_modifications $cmd devName:$devName \
+                            fIndex:$fIndex tIndex:$tIndex tKey:$tKey cIndex:$cIndex chainName:$chainName
+                    done
+                done
+            done
+
+            set_fw_inactive $fwName
+        ;;
+    esac
+} # => modify_runtime()
+
+# (function args)
+# $1 - arrayType
+# $2 - option
+print_arrays() {
+    local refName='' arrName=''
+    while read -r arrayInfo; do
+        refName="${arrayInfo%%=*}" arrName="${arrayInfo#*=}"
+        local "arrName_$refName"="$arrName"
+        declare -n $refName="$arrName"
+    done < <(get_nft_array_info $1)
+
+    echo "familyNames size: ${#familyNames[@]}"
+    echo "tableNames size: ${#tableNames[@]}"
+    echo "chainNames size: ${#chainNames[@]}"
+
+    echo "families size: ${#families[@]}"
+    echo "tables size: ${#tables[@]}"
+    echo "chains size: ${#chains[@]}"
+
+    echo '----FAMILIES DUMP----'
+    declare -p "$arrName_familyNames"
+    print_array "$arrName_families" output:pretty sort-by:addr
+
+    echo '----TABLES DUMP----'
+    declare -p "$arrName_tableNames"
+    print_array "$arrName_tables" output:pretty sort-by:addr
+
+    echo '----CHAINS DUMP----'
+    declare -p "$arrName_chainNames"
+    print_array "$arrName_chains" output:pretty sort-by:addr
+
+    echo '----HANDLES DUMP----'
+    print_array "$arrName_handles" output:pretty sort-by:addr
+
+    echo '----DEPENDENCIES DUMP----'
+    print_array "$arrName_chainDeps" output:pretty sort-by:addr
+    print_array "$arrName_ruleDeps" output:pretty sort-by:addr
+
+    local tIndex=-1 cIndex=-1
+    local fIndexLength=0 tIndexLength=0 cIndexLength=0
+    if [ -n "$2" ] && [ "$2" == "1" ]; then
+        {
+            echo '--BEGIN PRINT--'
+
+            for ((fIndex=0; fIndex < ${#familyNames[@]}; fIndex++))
+            do
+                echo "Family name: ${familyNames[$fIndex]}"
+
+                fIndexLength=$(associative_array "$arrName_families" find:index-length index:$fIndex)
+                for ((fKey=0; fKey < $fIndexLength; fKey++))
+                do
+                    tIndex=${families[$fIndex,$fKey]}
+                    echo "--Table name: ${tableNames[$tIndex]}"
+
+                    tIndexLength=$(associative_array "$arrName_tables" find:index-length index:$tIndex)
+                    for ((tKey=0; tKey < $tIndexLength; tKey++))
+                    do
+                        cIndex=${tables[$tIndex,$tKey]}
+                        echo "----Chain name: ${chainNames[$cIndex]}"
+
+                        cIndexLength=$(associative_array "$arrName_chains" find:index-length index:$cIndex)
+                        for ((cKey=0; cKey < $cIndexLength; cKey++))
+                        do
+                            echo "------Rule: ${chains[$cIndex,$cKey]}"
+
+                            if [ "${handles[$cIndex,$cKey]}" ]; then
+                                echo "------Handle: ${handles[$cIndex,$cKey]}"
+                            fi
+                        done
+                    done
+                done
+            done
+        }
+    fi
+}
+
+LOG_ENABLED=0
+RUNTIME_CHECK=0
+
+#[ -v OPT_DEBUG ] || OPT_DEBUG=0
+#[ -v OPT_DEBUG_FILE ] || OPT_DEBUG_FILE=''
+
+#[ -v OPT_ERRORS ] || OPT_ERRORS=0
+#[ -v OPT_ERRORS_FILE ] || OPT_ERRORS_FILE=''
+
+while :; do
+    opt="$(get_arg_opt $1)"
+    val="$(get_arg_val $1)"
+    emptyOk=0
+
+    case "$opt" in
+        --dev-name)
+            DEV_NAME="$val"
+        ;;
+        --log-file)
+            LOG_ENABLED=1
+            LOG_FILE_LOCATION="$val"
+            emptyOk=1
+        ;;
+        --config-file)
+            CONF_FILE_LOCATION="$val"
+        ;;
+        --runtime-check)
+            RUNTIME_CHECK=1
+	    emptyOk=1
+        ;;
+#        --debug)
+#            { [ -n "$val" ] && [ "$val" != "$1" ]; } && export OPT_DEBUG_FILE="$val"
+#            export OPT_DEBUG=1
+#            emptyOk=1
+#        ;;
+#        --errors)
+#            { [ -n "$val" ] && [ "$val" != "$1" ]; } && export OPT_ERRORS_FILE="$val"
+#            export OPT_ERRORS=1
+#            emptyOk=1
+#        ;;
+        *)
+            break
+        ;;
+    esac
+
+    if (($emptyOk == 0)) && { [ "$val" = "$1" ] || [ -z "$val" ]; }; then
+        die "Missing value to option: $opt"
+    fi
+
+    shift
+done
+
+#(($OPT_DEBUG == 1)) \
+#    && { [ -n "$OPT_DEBUG_FILE" ] \
+#        && {
+#            msg set-output type:debug debug:$OPT_DEBUG_FILE
+#            msg include-debug
+#            msg export-include-debug
+#        } || {
+#            msg set-output type:debug debug
+#            msg include-debug
+#            msg export-include-debug
+#        }; }
+#(($OPT_ERRORS == 1)) \
+#    && { [ -n "$OPT_ERRORS_FILE" ] \
+#        && {
+#            msg set-output type:warn,error file:$OPT_ERRORS_FILE
+#            msg include-errors
+#            msg export-include-errors
+#        } || {
+#            msg set-output type:warn,error
+#            msg include-errors
+#            msg export-include-errors
+#        }; }
+#{ [ -n "$1" ] \
+#    && cmd="$1" \
+#    || { (($OPT_DEBUG == 0)) && pdie "$NO_COMMAND_ERROR" $(get_current_file_name); }
+#} && shift;
+
+cmd="$1"
+[ -n "$1" ] && shift # scrape off command
+
+case "$cmd" in
+    init)
+        init_folders_and_files
+    ;;
+    has-firewall-config)
+        check_dev_name_exists
+        has_config_for_dev $DEV_NAME
+    ;;
+    insert-rules|merge-rules|remove-rules)
+        check_dev_name_exists
+    ;;&
+    insert-rules)
+        modify_runtime insert $DEV_NAME
+    ;;
+    merge-rules)
+        modify_runtime merge $DEV_NAME
+    ;;
+    remove-rules)
+        modify_runtime remove $DEV_NAME
+    ;;
+    modify-runtime)
+        cat /dev/stdin | modify_runtime $1 $DEV_NAME
+    ;;
+    test-parse)
+        if configFileLocation=$(get_config_file_location $DEV_NAME); then
+            cat $configFileLocation | parse_nft_config
+        else
+            cat /dev/stdin | parse_nft_config
+        fi
+    ;;
+    test-store-ruleset)
+        if configFileLocation=$(get_config_file_location $DEV_NAME); then
+            store_ruleset file <<<$(cat $configFileLocation)
+        else
+            store_ruleset file <<<$(cat /dev/stdin)
+        fi
+
+        print_arrays file
+    ;;
+#    *)
+#        (($OPT_DEBUG == 0)) && pdie "$UNKNOWN_COMMAND_ERROR" $(get_current_file_name) $cmd
+#    ;;
+esac
