@@ -674,7 +674,7 @@ find_properties_in_set() {
         do
             desiredProperty=${desiredProperties[$i]}
             let i=$i+1
-            { [ "$desiredProperty" == "$dataProperty" ] && let j=$j+1 || break; }
+            [ "$desiredProperty" == "$dataProperty" ] && let j=$j+1 || break
         done; IFS=$oldIFS
         { (($i > 0)) && (($i == $j)); } && return 0
     done </dev/stdin
@@ -685,11 +685,7 @@ find_properties_in_set() {
 # (function args)
 # $1 - arrayName
 array_exists() {
-    if [ "$({ declare -p $1 | sed -r -e 's/(declare\s-a)(.+)/\1/'; } 2>&14)" == "declare -a" ]; then
-        return 0
-    fi
-
-    return 1
+    [ "$({ declare -p $1 | sed -r -e 's/(declare\s-a)(.+)/\1/'; } 2>&14)" == "declare -a" ]; return $?
 } # => array_exists()
 
 # (function args)
@@ -722,32 +718,30 @@ array_contains() {
 # $1 - str
 # $2 - arrayName
 old_array_contains() {
-    declare -n arrayRef="$2"
-
-    while read -r line; do
-        if grep -E "^$1\$" <<<$line >/dev/null 2>&14; then return 0; fi
-    done < <(printf '%s\n' "${arrayRef[@]}")
-
-    return 1
+    declare -n arrayRef="$2" && {
+        while read -r line; do
+            if grep -E "^$1\$" <<<$line >/dev/null 2>&14; then return 0; fi
+        done < <(printf '%s\n' "${arrayRef[@]}")
+    }; return $?
 } # => array_contains()
 
 # (function args)
 # $1 - value
 # $2 - arrayName
 array_value_location() {
-    declare -n arrayRef="$2"
-
-    declare -a locations
-    {
-        while read loc; do
-            locations+=($(expr $loc - 1))
-        done < <(
-            printf '%s\n' "${arrayRef[@]}" | grep -n -Eo "^$1\$" | \
-                sed -r -e 's/^([0-9]+):.+/\1/'
-        )
-    } 2>&14 && {
-        ((${#locations[@]} > 0)) && echo ${locations[*]}
-    } || echo -1
+    declare -n arrayRef="$2" && {
+        declare -a locations
+        {
+            while read loc; do
+                locations+=($(expr $loc - 1))
+            done < <(
+                printf '%s\n' "${arrayRef[@]}" | grep -n -Eo "^$1\$" | \
+                    sed -r -e 's/^([0-9]+):.+/\1/'
+            )
+        } 2>&14 && {
+            ((${#locations[@]} > 0)) && echo ${locations[*]}
+        } || echo -1
+    }; return $?
 } # => array_value_location()
 
 # (function args)
@@ -755,6 +749,7 @@ array_value_location() {
 print_array_properties() {
     declare -n arrayRef=$1 2>/dev/null \
         && paste -d= <(printf '%s\n' "${!arrayRef[@]}") <(printf '%s\n' "${arrayRef[@]}")
+    return $?
 } # => print_array_properties()
 
 # (function args)
@@ -772,9 +767,7 @@ print_array_without_value() {
         done < <(replace_space_with_newline <&0)
 
         local dontPrint="$(replace_space_with_pipe "$(array_value_location 'arr' $1)")"
-    }; } || {
-        die "${FUNCNAME[0]}(): Array Name or Delimited Inbound Redirect required"
-    }
+    }; } || die "${FUNCNAME[0]}(): Array Name or Delimited Inbound Redirect required"
 
     [ -n "$2" ] && local delimiter="$2" || local delimiter='\n'
     {
@@ -1192,6 +1185,8 @@ associative_array() {
 parse_args() {
     local pri_type='' pri_val=-1
     local pri_default=0 pri_stdin=2 pri_supplied=1 pri_trMappings=-1
+    #TODO: ----------Use the return status from sed to kill two birds with one stone--------------
+    #---Its tempting use the right side of the 'paramArgs' assignment as a command substitution. Cordinate and use the same IFS, eliminate a good five lines if not more.. Worried it'd be slower if no PRI is passed.
     grep -Eq 'PRI:\[.+\]' <<<"$@" && {
         while read -d$RE_FS -r priInfo; do
             pri_type=${priInfo%:*}
