@@ -2,7 +2,11 @@
 
 localDir=$(dirname $0)
 
+source $localDir/global-vars
+CONFIG_BASE=$DEV_SYS_LIB_DIR
 source $localDir/netsys-base --lib
+
+declare -a DEV_CONFIG_PARAM_NAMES=(name devType devUpstream devMAC devCDIR enabled)
 
 NO_DEV_CONFIG_FILE_ERROR='Error loading dev:%s. No dev config file at:%s'
 
@@ -98,7 +102,7 @@ is_upstream_dev() {
     return $?
 } # => is_upstream_dev()
 
-# (function args)
+# (function args) TODO: Integrate with netsys-base?
 # $1 - devName
 has_dev_config() {
     [ -f "$DEV_SYS_LIB_DIR/d_$1" ] && return 0
@@ -109,13 +113,12 @@ has_dev_config() {
 # (function args)
 # $1 - devName
 source_dev_config() {
-    if has_dev_config "$1"; then
-        DEV_CONFIG_FILE_NAME="$1"
-        source "$DEV_SYS_LIB_DIR/d_$1"
-        return 0
-    fi
+    pdebug '[dev:%s] Attempting to load configuration file' $1
 
-    return 1
+    if ! source_config d_${1} "${DEV_CONFIG_PARAM_NAMES[@]}"; then
+        perror '[dev:%s] Could not load configuration file for dev' $1
+        return 1
+    fi
 } # => source_dev_config()
 
 # (function)
@@ -151,7 +154,7 @@ get_dev_names_for() {
         enabled)
             while read -r devName; do
                 if ! source_dev_config $devName; then
-                    die "$(printf "$NO_DEV_CONFIG_FILE_ERROR" $devName "$DEV_SYS_LIB_DIR/d_$devName")"
+                    die "$(printf "$NO_DEV_CONFIG_FILE_ERROR" $devName "$DEV_SYS_LIB_DIR/d_${devName}")"
                 fi
 
                 [ -v enabled ] && (($enabled == 1)) && echo "$name"
@@ -162,7 +165,7 @@ get_dev_names_for() {
 
             while read -r devName; do
                 if ! source_dev_config $devName; then
-                    die "$(printf "$NO_DEV_CONFIG_FILE_ERROR" $devName "$DEV_SYS_LIB_DIR/d_$devName")"
+                    die "$(printf "$NO_DEV_CONFIG_FILE_ERROR" $devName "$DEV_SYS_LIB_DIR/d_${devName}")"
                 fi
 
                 [ "$devUpstream" == "$opt_devName" ] && echo "$name"
@@ -276,7 +279,7 @@ dev_state() {
             { local mtu=$(get_either $devMTU $opt_mtu) c=$? && (($c == 0)); } \
                 || local mtu='1500'
 
-            (($configExists == 1)) && local msgInfo="[$DEV_CONFIG_FILE_NAME]" || local msgInfo="[$name]"
+            (($configExists == 1)) && local msgInfo="[$CONFIG_FILE_NAME]" || local msgInfo="[$name]"
             case "$type" in
                 l2tap-bridge)
                     case "$cmd" in

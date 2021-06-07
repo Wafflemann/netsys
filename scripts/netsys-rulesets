@@ -2,13 +2,11 @@
 
 localDir=$(dirname $0)
 
+source $localDir/global-vars
+CONFIG_BASE=$RULESETS_SYS_LIB_DIR
 source $localDir/netsys-base --lib
 
-NO_COMMAND_ERROR='%s(): No command specified'
-UNKNOWN_COMMAND_ERROR="%s(): Unknown command:'%s'"
-UNKNOWN_OPTION_ERROR="Unknown option:'%s'"
-MISSING_OPTION_VALUE_ERROR="Missing value to option:'%s'"
-OPTION_NOT_SPECIFIED_ERROR="option '%s' not specified"
+declare -a RULESETS_CONFIG_PARAM_NAMES=(tableName upstreamDev fromIP fromDev initDefaultGW removeFromDefaultTable gwDev gwIP devRoutes enabled)
 
 NO_RULESET_FILE_ERROR='Error loading table ruleset:%s. No table config file at:%s'
 
@@ -73,41 +71,21 @@ get_dev_required_code() {
 
 # (function args)
 # $1 - rulesetName
-has_ruleset_config() {
-    local rulesetFileLocation="$RULESETS_SYS_CONF_DIR/t_$1"
-    if [ -f "$rulesetFileLocation" ]; then
-        echo "$rulesetFileLocation"
-        return 0
-    fi
-
-    return 1
-} # => has_ruleset_config()
-
-# (function args)
-# $1 - rulesetName
 source_ruleset_config() {
-    unset tableName upstreamDev enabled
-    unset fromIP fromDev
-    unset initDefaultGW removeFromDefaultTable
-    unset gwDev gwIP
-    unset devRoutes
-
     pdebug "[ruleset:%s] Attempting to load configuration file" $1
-    if RULESET_FILE_LOCATION=$(has_ruleset_config "$1"); then
-        RULESET_NAME=$1
-        source $RULESET_FILE_LOCATION
-        return 0
+    if ! source_config t_${1} "${RULESETS_CONFIG_PARAM_NAMES[@]}"; then
+        perror "[ruleset:%s] Could not load configuration file for ruleset" $1
+        return 1
     fi
 
-    perror "[ruleset:%s] No configuration file found for ruleset" $1
-    return 1
+    RULESET_NAME=$1
 } # => source_ruleset_config()
 
 # (function)
 get_ruleset_names() {
-    escapedLocation="$(escape_slashes "$RULESETS_SYS_CONF_DIR/t_")"
+    escapedLocation="$(escape_slashes "$RULESETS_SYS_LIB_DIR/t_")"
 
-    find $RULESETS_SYS_CONF_DIR -type f | sed -r \
+    find $RULESETS_SYS_LIB_DIR -type f | sed -r \
         -e "/$escapedLocation/"'!d' \
         -e "s/($escapedLocation)(.+)/\2/"
 } # => get_ruleset_names()
@@ -137,7 +115,7 @@ get_ruleset_names_for() {
     local devRequiredCode=-1
     while read -r rulesetName; do
         if ! source_ruleset_config $rulesetName; then
-            pdie "$NO_RULESET_FILE_ERROR" $rulesetName $RULESET_FILE_LOCATION
+            pdie "$NO_RULESET_FILE_ERROR" $rulesetName $CONFIG_FILE_LOCATION
         fi
 
         case "$cmd" in
@@ -252,6 +230,8 @@ wait_ready_for_dev() {
     return $s
 } # => wait_ready_for_dev()
 
+declare -a TABLE_ROUTE_PARAM_NAMES=(name dev from-ip gw-ip gw-dev quiet)
+
 # (function args)
 # $1 - cmd
 # $2+ - options
@@ -300,7 +280,7 @@ table_route() {
         fi
     done
 
-#    parse_args SUP:"$*"  <----------PARSE ARGS--------------
+#    parse_args DEL:${RE_FS} PRE:opt_ SUP:"$*" "${TABLE_ROUTE_PARAM_NAMES[@]}"
 
     [ -z "$opt_tableName" ] && pdie "$cmd_msgError: $OPTION_NOT_SPECIFIED_ERROR" 'name'
 
@@ -533,7 +513,7 @@ ruleset() {
                 pdebug "$msgDebug" $RULESET_NAME $tableName 'Ruleset not loaded, loading ruleset'
                 if ! (
                     [ -z "$fromIP" ] && pdie "$msgError" $RULESET_NAME \
-                        "Param:'fromIP' required in config:'$RULESET_FILE_LOCATION'"
+                        "Param:'fromIP' required in config:'$CONFIG_FILE_LOCATION'"
 
                     table_route add-rule name:$tableName from-ip:$fromIP || exit 1
 
@@ -541,7 +521,7 @@ ruleset() {
                         pdebug "$msgDebug" $RULESET_NAME $tableName 'Default GW setup requested'
                         { [ -n "$gwIP" ] && [ -n "$gwDev" ] \
                             || pdie "$msgError" $RULESET_NAME \
-                                "Params:'gwIP','gwDev' required in config:'$RULESET_FILE_LOCATION'"
+                                "Params:'gwIP','gwDev' required in config:'$CONFIG_FILE_LOCATION'"
                         } && {
                             ! pdebug "$msgDebug" $RULESET_NAME $tableName \
                                     "Default Route via:$gwIP dev:$gwDev exists:$(
@@ -565,14 +545,14 @@ ruleset() {
                         done
                     else
                         pwarn "$msgDebug" $RULESET_NAME $tableName \
-                            "WARN: Param:'devRoutes' not present in config:'$RULESET_FILE_LOCATION'"
+                            "WARN: Param:'devRoutes' not present in config:'$CONFIG_FILE_LOCATION'"
                     fi
 
                     if [ -v removeFromDefaultTable ] && (($removeFromDefaultTable == 1)); then
                         pdebug "$msgDebug" $RULESET_NAME $tableName "Removal from '$systemTable' table requested"
                         if [ -z "$fromDev" ]; then
                             pdie "$msgError" $RULESET_NAME \
-                                "Param:'fromDev' required in config:'$RULESET_FILE_LOCATION'"
+                                "Param:'fromDev' required in config:'$CONFIG_FILE_LOCATION'"
                         fi
 
                         local devGWIP=''

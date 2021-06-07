@@ -2,7 +2,11 @@
 shopt -s extglob
 source /usr/local/sbin/global-vars
 
-MISSING_OPTION_VALUE_ERROR='Missing value to option'
+export NO_COMMAND_ERROR='%s(): No command specified'
+export UNKOWN_COMMAND_ERROR="%s(): Unkown command:'%s'"
+export UNKOWN_OPTION_ERROR="Uknown option:'%s'"
+export MISSING_OPTION_VALUE_ERROR="Missing value to option:'%s'"
+export OPTION_NOT_SPECIFIED_ERROR="option '%s' not specified"
 
 export NEWLINE=$'\n' TAB=$'\t'
 export RE_S='[[:space:]]*' RE_D='[0-9]*'
@@ -50,7 +54,7 @@ get_current_file_name() {
 # (function args)
 # $1 - length
 gen_rand_string() {
-    tr -dc A-Za-z0-9 </dev/urandom | head -c $1 ; echo ''
+    { tr -dc A-Za-z0-9 </dev/urandom | head -c $1; echo ''; } 2>/dev/null; return $?
 } # => gen_rand_string()
 
 # (function args)
@@ -63,31 +67,21 @@ escape_slashes() {
 # $1 - dirLocation
 # $2 - permissions
 create_dir() {
-    [ -d "$1" ] && return 1
-    mkdir -m $2 $1
-    return 0
+    { [ -d "$1" ] && return 1 || mkdir -m $2 $1; } 2>/dev/null; return $?
 } # => create_dir()
 
 # (function args)
 # $1 - fileLocation
 # $2 - permissions
 install_null_file() {
-    [ -f "$1" ] && return 1
-    install -m $2 /dev/null $1
-    return 0
+    { [ -f "$1" ] && return 1 || install -m $2 /dev/null $1; } 2>/dev/null; return $?
 } # => install_null_file()
 
 # (function args)
 # $1 - fileLocation
 # $2 - line
 file_contains_line() {
-    if [ -f "$1" ]; then
-        grep -q "^$2$" <<<"$(cat $1)"
-
-        return $?
-    else
-        return 2
-    fi
+    [ -f "$1" ] && { grep "^$2$" <$1; return $?; } >/dev/null 2>&1 || return 2
 } # => file_contains_line()
 
 [ -v SCRIPT_NAME ] || SCRIPT_NAME='netsys-base'
@@ -100,19 +94,17 @@ CURRENT_EXEC_ID=$(get_current_file_name)-$$
 # $1 - fileName / randNameLength
 # $2 - permissions
 create_tmp_file() {
-    local s=0
-    [ -n "$1" ] \
-        && { grep -Eq "^$RE_D$" <<<$1 \
+    [ -n "$1" ] && {
+        grep -Eq "^$RE_D$" <<<$1 \
             && local fileLocation="$TMP_DIR/$(gen_rand_string $1)" \
-            || local fileLocation="$TMP_DIR/$1"; } \
-        || local fileLocation="$TMP_DIR/$(gen_rand_string 8)"
+            || local fileLocation="$TMP_DIR/$1"
+    } || local fileLocation="$TMP_DIR/$(gen_rand_string 8)"
         
-    { [ -n "$2" ] && grep -Eq "^[0-9]{3}$" <<<$2; } \
+    local s=255
+    { { [ -n "$2" ] && grep -Eq "^[0-9]{3}$" <<<$2; }\
         && { install_null_file $fileLocation $2 || s=2; } \
-        || { install_null_file $fileLocation 640 || s=2; }
-
-    echo $fileLocation
-    return $s
+        || { install_null_file $fileLocation 640 || s=3; }
+    } 2>/dev/null && echo $fileLocation || return $s
 } # => create_tmp_file()
 
 # (function)
@@ -133,30 +125,32 @@ cleanup_tmp_dir() {
 # $1 - fallbackVal
 # $2 - preferredVal
 get_either() {
-    if [ -n "$2" ]; then
-        echo "$2"
-        return 0
-    elif [ -n "$1" ]; then
-        echo "$1"
-        return 0
-    fi
-
-    return 1
+    { [ -n "$2" ] && echo "$2"; } || { [ -n "$1" ] && echo "$1"; }; return $?
 } # => get_either()
 
 # (function args)
 # $1 - str
 get_arg_opt() {
-    ! { ! grep -q '=' <<<${1%%:*} && echo "${1%%:*}" && return 0; } \
-        || ! grep -q ':' <<<${1%%=*} && echo "${1%%=*}"
+    { ! grep -q '=' <<<${1%%:*} && { echo "${1%%:*}"; return 0; }; } \
+        || { ! grep -q ':' <<<${1%%=*} && echo "${1%%=*}"; }; return $?
 } # => get_arg_opt()
 
 # (function args)
 # $1 - str
 get_arg_val() {
-    ! { ! grep -q '=' <<<${1#*:} && echo "${1#*:}" && return 0; } \
-        || ! grep -q ':' <<<${1#*=} && echo "${1#*=}"
+    { ! grep -q '=' <<<${1#*:} && { echo "${1#*:}"; return 0; }; } \
+        || { ! grep -q ':' <<<${1#*=} && echo "${1#*=}"; }; return $?
 } # => get_arg_val()
+
+# (function args)
+# $1 - notString
+# $2 - argToCheck
+check_arg() {
+    { { [ -n "$1" ] \
+        && { [ -n "$2" ] && local argToCheck="$2"; } || { [ ! -t 0 ] && local argToCheck="$(cat <&0)"; } \
+        && { [ "$argToCheck" != "$1" ] && [ -n "$argToCheck" ]; }
+    } && printf "$argToCheck"; }; return $?
+} # => check_arg()
 
 # (function)
 print_args() {
@@ -194,8 +188,7 @@ set_msg_directives() {
         mIndex=$(get_msg_type_index $t)
 
         MSG_DIRECTIVES[$mIndex]="$t|$2"
-    done
-    IFS=$oldIFS
+    done; IFS=$oldIFS
 } # => set_msg_directives()
 
 # (function args)
@@ -257,33 +250,17 @@ msg() {
         val="$(get_arg_val $arg)"
 
         case "$opt" in
-            file)
-                logFile="$val"
-            ;;
-            debug)
-                { [ "$val" = "$arg" ] || [ -z "$val" ]; } \
-                    && debug=1 || debugFile="$val"
-                emptyOk=1
-            ;;
-            permissions)
-                logFilePermissions="$val"
-            ;;
-            type)
-                msgType="$val"
-            ;;
-            read-directives)
-                readDirectives=1
-                emptyOk=1
-            ;;
-            quiet)
-                stdout=0
-                emptyOk=1
-            ;;
+            file) logFile="$val";;
+            debug) debugFile=$(check_arg "$arg" "$val") || debug=1; emptyOk=1;;
+            permissions) logFilePermissions="$val";;
+            type) msgType="$val";;
+            read-directives) readDirectives=1; emptyOk=1;;
+            quiet) stdout=0; emptyOk=1;;
         esac
 
-        if (($emptyOk == 0)) && { [ "$val" = "$arg" ] || [ -z "$val" ]; }; then
+        if (($emptyOk == 0)) && ! check_arg "$arg" "$val" >/dev/null; then
             print "${FUNCNAME[0]}(): Missing value to option: $opt" 1>&2
-            prog_exit "${2:-1}"
+            prog_exit 1
         fi
     done
 
@@ -433,13 +410,10 @@ MSG_INCLUDE_DEBUG_PREV=0
 declare -a MSG_DIRECTIVES_PREV
 declare -a MSG_DIRECTIVES
 if [ -v MSG_DIRECTIVES_SERIAL ]; then
-    oldIFS=$IFS
-    IFS=';'; for directive in $MSG_DIRECTIVES_SERIAL
+    oldIFS=$IFS; IFS=';'; for directive in $MSG_DIRECTIVES_SERIAL
     do
         MSG_DIRECTIVES[${directive%,*}]="${directive#*,}"
-    done
-    IFS=$oldIFS
-    unset oldIFS
+    done; IFS=$oldIFS; unset oldIFS
 
     set_msg_directives 'debug' ''
     msg set-output read-directives
@@ -570,8 +544,7 @@ pinfo() {
 # $1 - errorMsg
 check_if_error_and_reset_msg() {
     local s=$?
-    (($s != 0)) \
-        && error $*
+    (($s != 0)) && error $*
     msg reset-all
     return $?
 } # => check_if_error_and_reset_msg()
@@ -580,8 +553,7 @@ check_if_error_and_reset_msg() {
 # $1+ - perrorArgs
 check_if_perror_and_reset_msg() {
     local s=$?
-    (($s != 0)) \
-        && perror $*
+    (($s != 0)) && perror $*
     msg reset-all
     return $?
 } # => check_if_perror_and_reset_msg()
@@ -589,20 +561,34 @@ check_if_perror_and_reset_msg() {
 # (function args)
 # $1 - str
 replace_space_with_pipe() {
-    sed -r -e 's/\s/\|/g' <<<"$([ -n "$1" ] && echo "$@" || cat </dev/stdin)" 2>&14
+    sed -r -e 's/\s/\|/g' <<<"$(
+        { [ -n "$1" ] && echo "$@"; } || { [ ! -t 0 ] && cat <&0; }
+    )"
 } # => replace_space_with_pipes()
 
 # (function args)
 # $1 -str
 replace_space_with_newline() {
-    sed -r -e "s/\s/${NEWLINE}/g" <<<"$([ -n "$1" ] && echo "$@" || cat </dev/stdin)" 2>&14
+    sed -r -e "s/\s/${NEWLINE}/g" <<<"$(
+        { [ -n "$1" ] && echo "$@"; } || { [ ! -t 0 ] && cat <&0; }
+    )"
 } # => replace_space_with_newline()
 
 # (function args)
 # $1 - str
 replace_pipe_with_newline() {
-    sed -r -e "s/\|/${NEWLINE}/g" <<<"$([ -n "$1" ] && echo "$@" || cat </dev/stdin)" 2>&14
+    sed -r -e "s/\|/${NEWLINE}/g" <<<"$(
+        { [ -n "$1" ] && echo "$@"; } || { [ ! -t 0 ] && cat <&0; }
+    )"
 } # => replace_pipe_with_newline()
+
+# (function args)
+# $1 - str
+replace_space_with_file_separator() {
+    sed -r -e "s/\s/$RE_FS/g; s/^(.+)$/\1$RE_FS/p" <<<"$(
+        { [ -n "$1" ] && echo "$@"; } || { [ ! -t 0 ] && cat <&0; }
+    )"
+} # => replace_space_with_file_separator()
 
 ACCEPTED_ARG_DELIMITERS=(':' '=')
 ACCEPTED_ARG_DELIMITERS_STR="$(replace_space_with_pipe "${ACCEPTED_ARG_DELIMITERS[*]}")"
@@ -620,11 +606,9 @@ get_delimiter_type() {
     do
         for delimiter in $acceptedDelimiters
         do
-            if grep -q "^${argType}${delimiter}.*" <<<$@; then
-                echo "$delimiter"
-                IFS=$oldIFS
-                return 0
-            fi
+            grep -q "^${argType}${delimiter}.*" <<<$@ \
+                && { echo "$delimiter"; IFS=$oldIFS; } \
+                && return 0
         done
     done
     IFS=$oldIFS
@@ -649,11 +633,11 @@ parse_multi_args() {
         :mtiaftr
         s/.*${desiredArgType}${argDelimiter}(.+)${RE_S}((${argTypes})${argDelimiter}.+){2,}/\1/p
         :oneaftr
-        s/.*${desiredArgType}${argDelimiter}(.+)${RE_S}((${argTypes})${argDelimiter}.+)/\1/p" \
-        <<<"$@" 2>&14)
+        s/.*${desiredArgType}${argDelimiter}(.+)${RE_S}((${argTypes})${argDelimiter}.+)/\1/p
+    " <<<"$@" 2>&14)
 
     [ -n "$argVal" ] \
-        && { { grep -q '\s$' <<<$argVal 2>&14 && echo "${argVal%${RE_S}}"; } || echo "${argVal}"; } \
+        && { grep -q '\s$' <<<$argVal 2>&14 && echo "${argVal%${RE_S}}" || echo "${argVal}"; } \
         || return 1
 } # => parse_multi_args()
 
@@ -701,7 +685,7 @@ find_properties_in_set() {
 # (function args)
 # $1 - arrayName
 array_exists() {
-    if [ "$(declare -p $1 2>&14 | sed -r -e 's/(declare\s-a)(.+)/\1/' 2>&14)" == "declare -a" ]; then
+    if [ "$({ declare -p $1 | sed -r -e 's/(declare\s-a)(.+)/\1/'; } 2>&14)" == "declare -a" ]; then
         return 0
     fi
 
@@ -711,13 +695,13 @@ array_exists() {
 # (function args)
 # $1 - arrayAddress
 get_address_index() {
-    cut -s -f1 -d, <<<"$([ -n "$1" ] && echo "$@" || cat </dev/stdin)"
+    cut -s -f1 -d, <<<"$({ [ -n "$1" ] && echo "$@"; } || { [ ! -t 0 ] && cat <&0; })"
 } # => get_address_index()
 
 # (function args)
 # $1 - arrayAddress
 get_address_key() {
-    cut -s -f2 -d, <<<"$([ -n "$1" ] && echo "$@" || cat </dev/stdin)"
+    cut -s -f2 -d, <<<"$({ [ -n "$1" ] && echo "$@"; } || { [ ! -t 0 ] && cat <&0; })"
 } # => get_address_key()
 
 # (function args)
@@ -725,14 +709,12 @@ get_address_key() {
 # $2 - arrayName
 array_contains() {
     input_contains $1 < <(
-        [ ! -t 0 ] \
-            && print_args $(cat <&0) \
-            || { [ -n "$2" ] \
-                && {
-                    declare -n arrayRef="$2"
-                    printf "%s${NEWLINE}" "${arrayRef[@]}"
-                }; } \
-            || return 2
+        { [ -n "$2" ] && {
+            declare -n arrayRef="$2"
+            printf "%s${NEWLINE}" "${arrayRef[@]}"
+        }; } || {
+            [ ! -t 0 ] && print_args $(cat <&0)
+        } || return 2
     )
 } # => array_contains()
 
@@ -743,7 +725,7 @@ old_array_contains() {
     declare -n arrayRef="$2"
 
     while read -r line; do
-        if grep -Eq "^$1\$" <<<$line 2>&14; then return 0; fi
+        if grep -E "^$1\$" <<<$line >/dev/null 2>&14; then return 0; fi
     done < <(printf '%s\n' "${arrayRef[@]}")
 
     return 1
@@ -756,22 +738,23 @@ array_value_location() {
     declare -n arrayRef="$2"
 
     declare -a locations
-    while read loc; do
-        locations+=($(expr $loc - 1))
-    done < <(
-        printf '%s\n' "${arrayRef[@]}" | grep -n -Eo "^$1\$" 2>&14 | \
-            sed -r -e 's/^([0-9]+):.+/\1/' 2>&14
-    )
-
-    ((${#locations[@]} > 0)) && echo ${locations[*]} || echo -1
+    {
+        while read loc; do
+            locations+=($(expr $loc - 1))
+        done < <(
+            printf '%s\n' "${arrayRef[@]}" | grep -n -Eo "^$1\$" | \
+                sed -r -e 's/^([0-9]+):.+/\1/'
+        )
+    } 2>&14 && {
+        ((${#locations[@]} > 0)) && echo ${locations[*]}
+    } || echo -1
 } # => array_value_location()
 
 # (function args)
 # $1 - arrayName
 print_array_properties() {
-    declare -n arrayRef=$1
-
-    paste -d= <(printf '%s\n' "${!arrayRef[@]}") <(printf '%s\n' "${arrayRef[@]}")
+    declare -n arrayRef=$1 2>/dev/null \
+        && paste -d= <(printf '%s\n' "${!arrayRef[@]}") <(printf '%s\n' "${arrayRef[@]}")
 } # => print_array_properties()
 
 # (function args)
@@ -779,17 +762,19 @@ print_array_properties() {
 # $2 - delimiter
 # $3 - arrayName
 print_array_without_value() {
-    if [ -n "$3" ]; then
+    { [ -n "$3" ] && {
         declare -n arr="$3"
         local dontPrint="$(replace_space_with_pipe "$(array_value_location $3 $1)")"
-    else
+    }; } || { [ ! -t 0 ] && {
         declare -a arr
         while read arrVal; do
             arr+=("$arrVal")
-        done < <(replace_space_with_newline </dev/stdin)
+        done < <(replace_space_with_newline <&0)
 
         local dontPrint="$(replace_space_with_pipe "$(array_value_location 'arr' $1)")"
-    fi
+    }; } || {
+        die "${FUNCNAME[0]}(): Array Name or Delimited Inbound Redirect required"
+    }
 
     [ -n "$2" ] && local delimiter="$2" || local delimiter='\n'
     {
@@ -797,15 +782,13 @@ print_array_without_value() {
         declare -i arrSize=${#arr[@]}
         for ((i=0; i < arrSize; i++))
         do
-            if (($i != $dontPrint)); then
-                if (($pCount > 0)); then
-                    printf "${delimiter}%s" "${arr[$i]}"
-                else
-                    printf "%s" "${arr[$i]}"
-                fi
+            (($i != $dontPrint)) && {
+                (($pCount > 0)) \
+                    && printf "${delimiter}%s" "${arr[$i]}" \
+                    || printf "%s" "${arr[$i]}"
 
                 let pCount=$pCount+1
-            fi
+            }
         done
     }
 } # => print_array_without_value()
@@ -822,58 +805,58 @@ generate_print_command() {
         do
             case "$printType" in
                 index)
-                    ! grep -q '%s,' <<<$pFmt 2>&14 && \
+                    ! grep -q '%s,' <<<$pFmt && \
                         pFmt="%s,${pFmt#,}"
                 ;;
                 key)
-                    ! grep -q ',%s' <<<$pFmt 2>&14 && \
+                    ! grep -q ',%s' <<<$pFmt && \
                         pFmt="$(cut -s -f1 -d, <<<$pFmt),%s$(cut -s -f2 -d= <<<$pFmt)"
                 ;;
                 value)
-                    ! grep -q '="%s"' <<<$pFmt 2>&14 && \
+                    ! grep -q '="%s"' <<<$pFmt && \
                         pFmt="${pFmt%%\#*}=\"%s\"$(cut -s -f2 -d# <<<$pFmt)"
                 ;;
                 count)
-                    ! grep -q '#%s' <<<$pFmt 2>&14 && \
+                    ! grep -q '#%s' <<<$pFmt && \
                         pFmt="${pFmt}#%s"
                 ;;
             esac
 
-            grep -Eq '.*,.*(="%s"|#%s)' <<<$pFmt 2>&14 && \
+            grep -Eq '.*,.*(="%s"|#%s)' <<<$pFmt && \
                 pFmt="[${pFmt%%+(=*|#*)}]${pFmt##+(*,\%s|\%s,)}"
         done
         IFS=$oldIFS
 
         pFmt="'${pFmt}\n'"
         pCMD="${pCMD} ${pFmt}"
-    }; }
+    } 2>&14; }
 
     local pVars='' t=''
     while [ -n "$pTypes" ]; do
-        { grep -q ',' <<<$pTypes 2>&14 && t="${pTypes%%,*}" pTypes="${pTypes#*,}"; } || t="$pTypes" pTypes=''
+        { grep -q ',' <<<$pTypes && t="${pTypes%%,*}" pTypes="${pTypes#*,}"; } || t="$pTypes" pTypes=''
         [ -n "$t" ] && {
             case "$t" in
                 index)
-                    ! grep -q 'index' <<<$pVars 2>&14 && \
+                    ! grep -q 'index' <<<$pVars && \
                         pVars="\"\$index\"${pVars}"
                 ;;
                 key)
-                    ! grep -q 'key' <<<$pVars 2>&14 && \
-                        pVars="$(sed -r -e 's/(\"\$index\")*(\"\$value\")*(\"\$count\")*/\1"\$key"\2\3/' <<<$pVars 2>&14)"
+                    ! grep -q 'key' <<<$pVars && \
+                        pVars="$(sed -r -e 's/(\"\$index\")*(\"\$value\")*(\"\$count\")*/\1"\$key"\2\3/' <<<$pVars)"
                 ;;
                 value)
-                    ! grep -q 'value' <<<$pVars 2>&14 && \
-                        pVars="$(sed -r -e 's/(\"\$index\")*(\"\$key\")*(\"\$count\")*/\1\2"\$value"\3/' <<<$pVars 2>&14)"
+                    ! grep -q 'value' <<<$pVars && \
+                        pVars="$(sed -r -e 's/(\"\$index\")*(\"\$key\")*(\"\$count\")*/\1\2"\$value"\3/' <<<$pVars)"
                 ;;
                 count)
-                    ! grep -q 'count' <<<$pVars 2>&14 && \
+                    ! grep -q 'count' <<<$pVars && \
                         pVars="$pVars\"\$count\""
                 ;;
             esac
-        }
+        } 2>&14
     done
 
-    pCMD="$pCMD $(sed -r -e 's/([a-z]\")(\"\$)/\1 \2/g' <<<$pVars 2>&14)"
+    pCMD="$pCMD $(sed -r -e 's/([a-z]\")(\"\$)/\1 \2/g' <<<$pVars)"
 
     echo "$pCMD"
 } # => generate_print_command()
@@ -897,10 +880,10 @@ parse_find_array_value_for_index() {
         index="${address%%,*}" key="${address#*,}"
 
         if [ "$index" == "$forIndex" ]; then
-            [ "$value" == "$@" ] && eval $pCMD && return 0
+            [ "$value" == "$@" ] && eval $pCMD 2>&14 && return 0
             let count=$count+1
         fi
-    done </dev/stdin
+    done <&0
 
     return 1
 } # => parse_find_array_value_for_index()
@@ -921,9 +904,9 @@ parse_find_array_value() {
         address="${line%%=*}" value="${line#*=}"
         index="${address%%,*}" key="${address#*,}"
 
-        [ "$value" == "$@" ] && eval $pCMD && return 0
+        [ "$value" == "$@" ] && eval $pCMD 2>&14 && return 0
         let count=$count+1
-    done </dev/stdin
+    done <&0
 
     return 1
 } # => parse_find_array_value()
@@ -942,10 +925,10 @@ parse_array_indicies() {
         address="${line%%=*}" value="${line#*=}"
         index="${address%%,*}" key="${address#*,}"
 
-        [ "$index" == "$forIndex" ] && eval $pCMD
+        [ "$index" == "$forIndex" ] && eval $pCMD 2>&14
 
         let count=$count+1
-    done </dev/stdin
+    done <&0
 } # => parse_array_indicies()
 
 # (function args)
@@ -962,12 +945,10 @@ parse_array_values() {
         address="${line%%=*}" value="${line#*=}"
         index="${address%%,*}" key="${address#*,}"
 
-        if [ "$value" == "$@" ]; then
-            eval $pCMD
-        fi
+        [ "$value" == "$@" ] && eval $pCMD 2>&14
 
         let count=$count+1
-    done </dev/stdin
+    done <&0
 } # => parse_array_values()
 
 # (function args)
@@ -986,12 +967,10 @@ parse_array_index_values() {
         address="${line%%=*}" value="${line#*=}"
         index="${address%%,*}" key="${address#*,}"
 
-        if [ "$index" == "$forIndex" ] && [ "$value" == "$@" ]; then
-            eval $pCMD
-        fi
+        { [ "$index" == "$forIndex" ] && [ "$value" == "$@" ]; } && eval $pCMD 2>&14
 
         let count=$count+1
-    done </dev/stdin
+    done <&0
 } # => parse_array_index_values()
 
 # (function args)
@@ -1006,9 +985,9 @@ parse_array() {
         address="${line%%=*}" value="${line#*=}"
         index="${address%%,*}" key="${address#*,}"
 
-        eval $pCMD
+        eval $pCMD 2>&14
         let count=$count+1
-    done </dev/stdin
+    done <&0
 } # => parse_array()
 
 # (function args)
@@ -1027,15 +1006,9 @@ print_array() {
         val=$(get_arg_val "$arg")
 
         case "$opt" in
-            output)
-                output="$val"
-            ;;
-            sort-by)
-                sortBy="$val"
-            ;;
-            sort-direction)
-                sortDirection="$val"
-            ;;
+            output) output="$val";;
+            sort-by) sortBy="$val";;
+            sort-direction) sortDirection="$val";;
         esac
     done
 
@@ -1076,12 +1049,8 @@ print_array() {
         IFS=','; for outputOption in $output
         do
             case "$outputOption" in
-                newline)
-                    pOpt_newline=1
-                ;;
-                pretty)
-                    pOpt_pretty=1
-                ;;
+                newline) pOpt_newline=1;;
+                pretty) pOpt_pretty=1;;
             esac
         done
         IFS=$oldIFS
@@ -1091,10 +1060,10 @@ print_array() {
         printf '%s=(' $arrayName
 
         if (($pOpt_newline == 1)); then
-            cat <$array_print | sed -r -e "s/($RE_D,$RE_D)=(.+)/[\1]=\2/g" 2>&14
+            cat <$array_print | sed -r -e "s/($RE_D,$RE_D)=(.+)/[\1]=\2/g"
         else
             while read -r line; do
-                printf '%s ' $(sed -r -e "s/($RE_D,$RE_D)=(.+)/[\1]=\2/" <<<$line 2>&14)
+                printf '%s ' $(sed -r -e "s/($RE_D,$RE_D)=(.+)/[\1]=\2/" <<<$line)
             done <$array_print
         fi
 
@@ -1222,27 +1191,26 @@ associative_array() {
 # $1+ - params_Key/DefaultVal
 parse_args() {
     local pri_type='' pri_val=-1
-    local pri_default=0 pri_stdin=2 pri_supplied=1
-    grep -Eq 'PRI:\[.+\]' <<<"$@" \
-        && {
-            while read -d$RE_FS -r priInfo; do
-                pri_type=${priInfo%:*}
-                pri_val=${priInfo#*:}
+    local pri_default=0 pri_stdin=2 pri_supplied=1 pri_trMappings=-1
+    grep -Eq 'PRI:\[.+\]' <<<"$@" && {
+        while read -d$RE_FS -r priInfo; do
+            pri_type=${priInfo%:*}
+            pri_val=${priInfo#*:}
 
-               case "$pri_type" in
-                    DEFLT) pri_default=$pri_val;;
-                    STDIN) pri_stdin=$pri_val;;
-                    SUPLD) pri_supplied=$pri_val;;
-                esac
-            done < <(sed -r -ne "s/.*PRI:\[(.+)\].*/\1$RE_FS/; s/,/$RE_FS/gp" <<<"$@")
+           case "$pri_type" in
+                DEFLT) pri_default=$pri_val;;
+                STDIN) pri_stdin=$pri_val;;
+                SUPLD) pri_supplied=$pri_val;;
+            esac
+        done < <(sed -r -ne "s/.*PRI:\[(.+)\].*/\1$RE_FS/; s/,/$RE_FS/gp" <<<"$@")
 
-            local paramArgs=$(IFS=$RE_US; sed -r -e 's/(.+)*(PRI:\[.+\])(.+)*/\1\3/' <<<"$*")
-        } || {
-            local oldIFS=$IFS
-            IFS=$RE_US
-            local paramArgs="$*"
-            IFS=$oldIFS
-        }
+        local paramArgs=$(IFS=$RE_US; sed -r -e 's/(.+)*(PRI:\[.+\])(.+)*/\1\3/' <<<"$*")
+    } || {
+        local oldIFS=$IFS
+        IFS=$RE_US
+        local paramArgs="$*"
+        IFS=$oldIFS
+    }
 
     declare -a suppliedArgs
     declare -a paramNames
@@ -1250,7 +1218,7 @@ parse_args() {
     declare -A params
 
     local p_name='' p_val='' emptyOk=0
-    local opt_del=$'\n'
+    local opt_del=$'\n' opt_pre=''
     while read -d$RE_US -r paramArg; do
         emptyOk=0
         p_name=$(get_arg_opt "$paramArg")
@@ -1260,10 +1228,21 @@ parse_args() {
             DEL)
                 opt_del="$p_val"
             ;;
+            PRE)
+                opt_pre="$p_val"
+            ;;
             SUP)
                 while read -d$RE_FS -r suppliedArg; do
                     suppliedArgs+=("$suppliedArg")
-                done < <(sed -r -ne "s/\s/$RE_FS/g; s/^(.+)$/\1$RE_FS/p" <<<"$p_val")
+                done < <(replace_space_with_file_separator "$p_val")
+            ;;
+            TR)
+                pri_trMappings=255
+                while read -d$RE_FS -r trMapping; do
+                    params[$pri_trMappings,$(get_arg_opt "$trMapping")]="$(
+                        ! { get_arg_val "$trMapping" | check_arg $trMapping; } && continue
+                    )"
+                done < <(sed -r -ne "s/^\[(.+)\]$/\1$RE_FS/; s/(,|\s)/$RE_FS/gp" <<<"$p_val")
             ;;
             *)
                 emptyOk=1
@@ -1274,9 +1253,8 @@ parse_args() {
             ;;
         esac
 
-        if (($emptyOk == 0)) && { [ "$p_val" = "$paramArg" ] || [ -z "$p_val" ]; }; then
-            print "${FUNCNAME[0]}(): Missing value for paramArg:'$p_name'" 1>&2
-            prog_exit "${2:-1}"    # <-------------------THIS PRY DOESN'T FIT THIS CONTEXT-------------
+        if (($emptyOk == 0)) && ! check_arg "$paramArg" "$p_val" >/dev/null; then
+            pdie "$MISSING_OPTION_VALUE_ERROR" $p_name
         fi
     done <<<"$paramArgs"
 
@@ -1308,6 +1286,10 @@ parse_args() {
         unset params[$pri_supplied]
     fi
 
+    (($pri_trMappings == 255)) \
+        && local varSetNameResolution="\${opt_pre}\$(get_either \${p_name} \${params[\$pri_trMappings,\$p_name]})" \
+        || local varSetNameResolution="\${opt_pre}\${p_name}"
+
     p_name='' p_val=-1
     pri_type='' pri_val=''
     while read -r paramInfo; do
@@ -1317,72 +1299,62 @@ parse_args() {
         p_val=${paramInfo#*=}
 
         if array_contains $p_name <<<"${paramNames[@]}" >/dev/null && [ -n "${params[$pri_val,$p_name]}" ]; then
-            eval "${p_name}='${params[$pri_val,$p_name]}'"
+            eval "${varSetNameResolution@P}='${params[$pri_val,$p_name]}'"
         fi
-    done < <(print_array_properties 'params' | sort -t ',' -k1 -n -r)
+    done < <(print_array_properties 'params' | sort -t ',' -k1 -n -r | sed -r "/^$pri_trMappings,.+$/d")
 } # => parse_args()
 
 [ ! -v CONFIG_BASE ] && CONFIG_BASE=$GBL_SYS_LIB_DIR
 
 # (function args)
 # $1 - configFileName
+# $2+ - paramNames
 source_config() {
-    CONFIG_FILE_LOCATION="$CONFIG_BASE/$1"
-    if [ -f "$CONFIG_FILE_LOCATION" ]; then
-        CONFIG_FILE_NAME="$1"
-        source "$CONFIG_FILE_LOCATION"
-        return 0
-    fi
+    [ -n "$1" ] && {
+        local configFileName="$1"; shift
 
-    return 1
+        while read -r paramName; do
+            unset $paramName
+        done < <({ [ -n "$1" ] && print_args "$@"; } || { [ ! -t 0 ] && print_args $(cat <&0); })
+    } 2>&14 && {
+        CONFIG_FILE_LOCATION="$CONFIG_BASE/$configFileName"
+        [ -f "$CONFIG_FILE_LOCATION" ] && {
+            CONFIG_FILE_NAME="$configFileName"
+            source "$CONFIG_FILE_LOCATION"
+        }
+    } 2>&14; return $?
 } # => source_config()
 
 # (function args)
 # $1 - configFileName
 # $2+ - paramNames
 serialize_source_config() {
-    [ -n "$1" ] && { local configFileName="$1"; shift; }
+    [ -n "$1" ] && {
+        local configFileName="$1"; shift;
 
-    if source_config $configFileName; then
-        for paramName in "$@"
-        do
-            array_exists $paramName \
-                && {
+        source_config $configFileName "$@" && {
+            for paramName in "$@"
+            do
+                array_exists $paramName && {
                     declare -n arrayRef=$paramName
                     printf "%s=(%s)$RE_FS" ${paramName} "${arrayRef[*]}"
                 } || printf "${paramName}=${!paramName}$RE_FS"
-        done
-
-        return 0
-    fi
-
-    return 1
+                unset $paramName
+            done
+        }
+    }; return $?
 } # => serialize_source_config()
-
-# (function args)
-# $1 - valName
-# $2 - val
-check_val() {
-    if [ -z "$2" ]; then
-        die "Missing value: $1"
-#        return 1
-    fi
-} # => check_val()
 
 # (function args)
 # $1 - devName
 is_dev_configured() {
-    file_contains_line $DEV_SYS_CONFIGURED_DEVS_FILE $1
-
-    return $?
+    file_contains_line $DEV_SYS_CONFIGURED_DEVS_FILE $1; return $?
 } # => is_dev_configured()
 
 # (function args)
 # $1 - devName
 is_dev_available() {
-    file_contains_line $DEV_SYS_AVAIL_DEVS_FILE $1
-
-    return $?
+    file_contains_line $DEV_SYS_AVAIL_DEVS_FILE $1; return $?
 } # => is_dev_available()
 
 # (function args)
@@ -1398,9 +1370,9 @@ wait_till_dev_available() {
     let endTime=$SECONDS+$timeToWait
     while (($SECONDS < $endTime))
     do
-        is_dev_available $devName
-	(($? == 0)) \
-            && echo "$((($SECONDS-($endTime-$timeToWait))))s" && return 0
+        if is_dev_available $devName; then
+            echo "$((($SECONDS-($endTime-$timeToWait))))s"; return 0
+        fi
 
         sleep $pollingInterval
     done
@@ -1424,28 +1396,23 @@ read_available_devs() {
 # (function args)
 # $1 - devName
 dev_exists() {
-    ip link show $1 >/dev/null 2>&14
-
-    return $?
+    ip link show $1 >/dev/null 2>&14; return $?
 } # => dev_exists()
 
 # (function args)
 # $1 - devName
 is_dev_up() {
-    grep -Eq '<(.+,)*UP(,.+)*>' < <(ip link show $1 2>&14) 2>&14
-
-    return $?
+    { grep -Eq '<(.+,)*UP(,.+)*>' < <(ip link show $1); } 2>&14; return $?
 } # => is_dev_up()
 
 # (function args)
 # $1 - dev
 get_dev_IP() {
     local devIP=''
-    ! devIP="$(ip address show $1 2>&14 | sed -r \
-        -e '/inet\s/ !d' \
-        -e "s/(.+inet\s)($RE_IP)(\/.+)/\2/" 2>&14)" && return $?
-
-    [ -n "$devIP" ] && echo "$devIP" || return 1
+    { devIP="$(ip address show $1 | sed -r \
+            -e '/inet\s/ !d' \
+            -e "s/(.+inet\s)($RE_IP)(\/.+)/\2/")" \
+        && echo $devIP; } 2>&14; return $?
 } # => get_dev_IP()
 
 # (function args)
@@ -1455,45 +1422,41 @@ get_dev_gw_IP() {
     [ -n "$2" ] && local tableName="$2" || local tableName='main'
 
     local devGWIP=''
-    ! devGWIP="$(ip route show table $tableName 2>&14 | sed -r \
-        -ne "s/default\svia\s($RE_IP)\sdev\s($1)(\s(.+)*src\s($RE_IP)|.+)*(\smetric.+)*/\1/p" 2>&14)" && return $?
-
-    [ -n "$devGWIP" ] && echo "$devGWIP" || return 1
+    { devGWIP="$(ip route show table $tableName | sed -r \
+            -ne "s/default\svia\s($RE_IP)\sdev\s($1)(\s(.+)*src\s($RE_IP)|.+)*(\smetric.+)*/\1/p")" \
+        && echo $devGWIP; } 2>&14; return $?
 } # => get_dev_gw_IP()
 
 # (function args)
 # $1 - dev
 get_dev_CDIR() {
     local devCDIR=''
-    ! devCDIR="$(ip address show $1 2>&14 | sed -r \
-        -e '/inet\s/ !d' \
-        -e "s/(.+inet\s)($RE_CDIR)(\sbrd.+)/\2/" 2>&14)" && return $?
-
-    [ -n "$devCDIR" ] && echo "$devCDIR" || return 1
+    { devCDIR="$(ip address show $1 | sed -r \
+            -e '/inet\s/ !d' \
+            -e "s/(.+inet\s)($RE_CDIR)(\sbrd.+)/\2/")" \
+        && echo $devCDIR; } 2>&14; return $?
 } # => get_dev_CDIR()
 
 # (function args)
 # $1 - CDIR
 get_net_CDIR() {
     local netCDIR=''
-    ! netCDIR="$(ipcalc $1 2>&14 | awk '$1 == "Network:" { print $2 }' 2>&14)" && return $?
-
-    [ -n "$netCDIR" ] && echo "$netCDIR" || return 1
+    { netCDIR="$(ipcalc $1 | awk '$1 == "Network:" { print $2 }')" \
+        && echo $netCDIR; } 2>&14; return $?
 } # => get_net_CDIR()
 
 # (function args)
 # $1 - CDIR
 get_broadcast_IP() {
     local broadcastIP=''
-    ! broadcastIP="$(ipcalc $1 2>&14 | awk '$1 == "Broadcast:" { print $2 }' 2>&14)" && return $?
-
-    [ -n "$broadcastIP" ] && echo "$broadcastIP" || return 1
+    { broadcastIP="$(ipcalc $1 | awk '$1 == "Broadcast:" { print $2 }')" \
+        && echo $broadcastIP; } 2>&14; return $?
 } # => get_broadcast_IP()	
 
 # (function args)
 # $1 - dev
 get_net_CDIR_from_dev() {
-    ! get_net_CDIR $(get_dev_CDIR $1) && return 1
+    get_net_CDIR $(get_dev_CDIR $1); return $?
 } # => get_net_CDIR_from_dev()
 
 # (function args)
@@ -1507,35 +1470,29 @@ route_contains_src() {
     [ "$2" == 'default' ] \
         && { [ -n "$4" ] \
             && re_routeID="${re_routeID/\#/$(escape_slashes $4)}" \
-            || re_routeID="${re_routeID/\#/$RE_IP}"; } \
-        || re_routeID="($(escape_slashes $2))"
+            || re_routeID="${re_routeID/\#/$RE_IP}"
+        } || re_routeID="($(escape_slashes $2))"
 
     local routeInfo=''
-    ! routeInfo="$(ip route show table $1 2>&14 | sed -r \
-        -ne "s/${re_routeID}\sdev\s($3)(\s(.+)*src\s($RE_IP)|.+)*(\smetric.+)*/\2|\5/p" 2>&14)" && return $?
-
-    [ -n "$routeInfo" ] \
-        && { grep -Eq "^$RE_IP\$" <<<"${routeInfo#*|}" 2>&14 && return 0 || return 1; } \
-        || return 2
+    { routeInfo="$(ip route show table $1 | sed -r \
+            -ne "s/${re_routeID}\sdev\s($3)(\s(.+)*src\s($RE_IP)|.+)*(\smetric.+)*/\2|\5/p")" \
+        && grep -Eq "^$RE_IP\$" <<<${routeInfo#*|}; return $?; } 2>&14 || return 2
 } # => route_contains_src()
 
 # (function args)
 # $1 - rulesetName
 is_ruleset_loaded() {
-    file_contains_line $RULESETS_SYS_LOADED_RULESETS_FILE $1
-
-    return $?
+    file_contains_line $RULESETS_SYS_LOADED_RULESETS_FILE $1; return $?
 } # => is_ruleset_loaded()
 
 # (function)
 get_netsys_scripts() {
-    find $localDir/netsys-* -type f | \
-        sed -e "/$SCRIPT_NAME/d"
+    find $localDir/netsys-* -type f | sed -e "/$SCRIPT_NAME/d"
 } # => get_netsys_scripts()
 
 # (function)
 is_init() {
-    [ -d "$GBL_SYS_RUN_DIR" ] && return 0 || return 1
+    [ -d "$GBL_SYS_RUN_DIR" ]; return $?
 } # is_init()
 
 # (function)
@@ -1546,9 +1503,7 @@ init_sys() {
         tr '\n' '\174' <<<$GBL_SYS_IGNORE_DEVS_VAL | sed -r -e 's/(.+)\|/\1/' >>$GBL_SYS_IGNORE_DEVS_FILE
 
         while read -r netsysScript; do
-		echo "initializing:$netsysScript"
-            $netsysScript init
-	    #1>/dev/null 2>&1
+            $netsysScript init >/dev/null 2>&1
         done < <(get_netsys_scripts)
 
         return 0
@@ -1574,14 +1529,18 @@ while :; do
         ;;
     esac
 
-    if (($emptyOk == 0)) && { [ -n "$val" = "$1" ] || [ -z "$val" ]; }; then
-        die "Missing value to option:'$opt'"
+    if (($emptyOk == 0)) && ! check_arg "$1" "$val" >/dev/null; then
+        pdie "$MISSING_OPTION_VALUE_ERROR" $opt
     fi
 
     shift
 done
 
-{ [ -n "$1" ] && cmd="$1" || { (($OPT_LIB == 0)) && die 'No command specified'; }; } && shift;
+{ [ -n "$1" ] \
+    && cmd="$1" \
+    || { (($OPT_LIB == 0)) && pdie "$NO_COMMAND_ERROR" $(get_current_file_name); }
+} && shift
+
 case "$cmd" in
     is_init)
         is_init
@@ -1590,6 +1549,6 @@ case "$cmd" in
         init_sys
     ;;
     *)
-        (($OPT_LIB == 0)) && die "Unkown command:'$cmd'"
+        (($OPT_LIB == 0)) && pdie "$UNKOWN_COMMAND_ERROR" $(get_current_file_name) $cmd
     ;;
 esac
